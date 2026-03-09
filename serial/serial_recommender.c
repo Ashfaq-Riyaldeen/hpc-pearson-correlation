@@ -1,22 +1,3 @@
-/*
- * serial_recommender.c
- * EC7207: High Performance Computing – Group 11
- *
- * Serial baseline: Pearson Correlation User-Based Collaborative Filtering
- *
- * Usage:
- *   ./serial_rec [num_users] [num_items]
- *
- *   Defaults: num_users=1000, num_items=1000
- *
- * Examples:
- *   ./serial_rec                  (1000 users, 1000 items)
- *   ./serial_rec 500 300          (500 users, 300 items)
- *
- * Compile:
- *   gcc -O2 -o serial_rec serial_recommender.c -lm
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,10 +16,6 @@
 static int N_USERS;
 static int N_ITEMS;
 
-/*
- * All matrices stored as flat 1-D dynamically allocated arrays.
- * Access: ratings[u * N_ITEMS + i]
- */
 static float *ratings;      /* [N_USERS × N_ITEMS] – 0 = unrated             */
 static float *user_mean;    /* [N_USERS]                                      */
 static float *sim_matrix;   /* [N_USERS × N_USERS]                           */
