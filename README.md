@@ -1,6 +1,6 @@
 ## 1. Serial Version
 
-### Compile (run once from the `Ashfaq/` folder)
+### Compile (run once from the folder)
 
 ```bash
 gcc -O2 -Wall -o serial_rec serial/serial_recommender.c -lm
@@ -21,7 +21,7 @@ gcc -O2 -Wall -o serial_rec serial/serial_recommender.c -lm
 
 ## 2. OpenMP Shared Memory Version
 
-### Compile (run once from the `Ashfaq/` folder)
+### Compile (run once from the folder)
 
 ```bash
 gcc -O2 -Wall -fopenmp -o openmp_rec openmp/openmp_recommender.c -lm
