@@ -127,3 +127,99 @@ static void generate_data(void)
     printf("[Data] Users: %d | Items: %d | Test ratings: %d\n",
            N_USERS, N_ITEMS, test_size);
 }
+
+/* User mean computation */
+static void *thread_user_means(void *arg)
+{
+    ThreadArgs *a = (ThreadArgs *)arg;
+
+    int start, end;
+    work_range(N_USERS, a->tid, a->nthreads, &start, &end);
+
+    for (int u = start; u < end; u++) {
+
+        double sum = 0.0;
+        int cnt = 0;
+
+        for (int i = 0; i < N_ITEMS; i++) {
+
+            if (R(u, i) != 0.0f) {
+                sum += R(u, i);
+                cnt++;
+            }
+        }
+
+        user_mean[u] = (cnt > 0)
+                       ? (float)(sum / cnt)
+                       : 3.0f;
+    }
+
+    return NULL;
+}
+
+/* Pearson similarity */
+static float pearson_similarity(int u, int v)
+{
+    double num = 0.0;
+    double den_u = 0.0;
+    double den_v = 0.0;
+
+    int co = 0;
+
+    float mu = user_mean[u];
+    float mv = user_mean[v];
+
+    for (int i = 0; i < N_ITEMS; i++) {
+
+        if (R(u, i) != 0.0f && R(v, i) != 0.0f) {
+
+            double du = R(u, i) - mu;
+            double dv = R(v, i) - mv;
+
+            num += du * dv;
+            den_u += du * du;
+            den_v += dv * dv;
+
+            co++;
+        }
+    }
+
+    if (co < 2)
+        return 0.0f;
+
+    double denom = sqrt(den_u) * sqrt(den_v);
+
+    if (denom < 1e-10)
+        return 0.0f;
+
+    float s = (float)(num / denom);
+
+    if (s > 1.0f) s = 1.0f;
+    if (s < -1.0f) s = -1.0f;
+
+    return s;
+}
+
+/* Similarity matrix */
+static void *thread_similarities(void *arg)
+{
+    ThreadArgs *a = (ThreadArgs *)arg;
+
+    int start, end;
+    work_range(N_USERS, a->tid, a->nthreads, &start, &end);
+
+    for (int u = start; u < end; u++) {
+
+        SIM(u, u) = 1.0f;
+
+        for (int v = u + 1; v < N_USERS; v++) {
+
+            float s = pearson_similarity(u, v);
+
+            SIM(u, v) = s;
+            SIM(v, u) = s;
+        }
+    }
+
+    return NULL;
+}
