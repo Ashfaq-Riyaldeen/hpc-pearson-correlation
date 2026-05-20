@@ -83,9 +83,10 @@ gcc -O2 -Wall -o serial_rec serial/serial_recommender.c -lm
 gcc -O2 -Wall -fopenmp -o openmp_rec openmp/openmp_recommender.c -lm
 mpicc -O2 -Wall -o mpi_rec mpi/mpi_recommender.c -lm
 
-# Run and note "Total (sim+pred)" time from each output
+# Serial baseline
 ./serial_rec
 
+# OpenMP scaling (1 thread = baseline)
 OMP_NUM_THREADS=1  ./openmp_rec
 OMP_NUM_THREADS=2  ./openmp_rec
 OMP_NUM_THREADS=4  ./openmp_rec
