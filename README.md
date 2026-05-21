@@ -208,44 +208,64 @@ mpirun -np 2 env OMP_NUM_THREADS=4 ./hybrid_rec 2000 1500
 
 ---
 
-## Reproducing the speedup table by hand
+---
 
-`results/run_benchmarks.sh` does this automatically; the manual equivalent is:
+## 3. MPI Distributed Memory Version
+
+### Compile (run once from the folder)
 
 ```bash
-# Compile all versions
-gcc   -O2 -Wall            -o serial_rec   serial/serial_recommender.c              -lm
-gcc   -O2 -Wall -fopenmp   -o openmp_rec   openmp/openmp_recommender.c              -lm
-gcc   -O2 -Wall            -o pthreads_rec pthreads/pthreads_recommender.c -lpthread -lm
-mpicc -O2 -Wall            -o mpi_rec      mpi/mpi_recommender.c                    -lm
-mpicc -O2 -Wall -fopenmp   -o hybrid_rec   hybrid/hybrid_recommender.c              -lm
-nvcc  -O2 -arch=sm_86      -o cuda_rec     cuda/cuda_recommender.cu                 -lm
-
-# Baseline + worker sweeps
-./serial_rec 1000 1000
-for T in 1 2 4 8; do OMP_NUM_THREADS=$T ./openmp_rec 1000 1000; done
-for T in 1 2 4 8; do ./pthreads_rec 1000 1000 $T; done
-for P in 1 2 4 8; do mpirun -np $P ./mpi_rec 1000 1000; done
-./cuda_rec 1000 1000
-for C in "2 4" "4 2" "8 1" "1 8"; do set -- $C; mpirun -np $1 env OMP_NUM_THREADS=$2 ./hybrid_rec 1000 1000; done
+mpicc -O2 -Wall -o mpi_rec mpi/mpi_recommender.c -lm
 ```
 
-Read the `[Timing] Total (sim+pred)` line from each run.
-**Speedup = Serial_total / Parallel_total.**
+### Run – process count via `mpirun -np`
+
+```bash
+# Default sizes (1000 users, 1000 items) – vary process count only
+mpirun -np 2 ./mpi_rec
+mpirun -np 4 ./mpi_rec
+mpirun -np 8 ./mpi_rec
+
+# Custom sizes: mpirun -np <num_procs> ./mpi_rec [num_users] [num_items]
+mpirun -np 4 ./mpi_rec 500 300
+mpirun -np 2 ./mpi_rec 2000 1500
+mpirun -np 4 ./mpi_rec 2000 1500
+```
+
+### Key Features
+- **Distributed similarity computation**: Each process computes its assigned block of user similarity matrix rows
+- **Data broadcasting**: Rating matrix distributed from rank 0 to all processes
+- **Allgatherv**: Efficient gathering of similarity rows and predictions across all processes
+- **Scalability**: Linear scaling with number of MPI processes (up to the number of users)
 
 ---
 
-## Results, report & diagrams
+## 4. Speedup Benchmark (for the report)
 
-- **Report:** `analysis_report/analysis_report.pdf` (built from `analysis_report.tex`); a Markdown twin is at `analysis_report/ANALYSIS_REPORT.md`.
-- **Concept diagrams:** `analysis_diagrams/drawio/` (editable `.drawio` + exported `png/`).
-- **Performance charts:** `analysis_diagrams/charts/` (generated from `results/` by `generate_charts.py`).
-- **Raw data:** `results/timing_raw.txt`, `speedup_table.csv`, `mae_comparison.txt`.
+```bash
+# Compile all three versions
+gcc -O2 -Wall -o serial_rec serial/serial_recommender.c -lm
+gcc -O2 -Wall -fopenmp -o openmp_rec openmp/openmp_recommender.c -lm
+mpicc -O2 -Wall -o mpi_rec mpi/mpi_recommender.c -lm
 
-## Correctness
+# Serial baseline
+./serial_rec
 
-Every version (CPU and GPU) produces an identical **MAE = 1.2574**,
-**RMSE = 1.4579**, and **similarity-matrix checksum = 942.387323** for the
-default 1000×1000 / `SEED=42` input. Matching results across all versions is
-the project's correctness check — any deviation would indicate a race condition
-or a partitioning bug.
+# OpenMP scaling (1 thread = baseline)
+OMP_NUM_THREADS=1  ./openmp_rec
+OMP_NUM_THREADS=2  ./openmp_rec
+OMP_NUM_THREADS=4  ./openmp_rec
+OMP_NUM_THREADS=8  ./openmp_rec
+
+mpirun -np 1 ./mpi_rec
+mpirun -np 2 ./mpi_rec
+mpirun -np 4 ./mpi_rec
+mpirun -np 8 ./mpi_rec
+```
+
+### Performance Analysis
+- Compare **execution times** across serial, OpenMP, and MPI versions
+- Calculate **speedup** = Serial_Time / Parallel_Time
+- Analyze **efficiency** = Speedup / Number_of_Processors
+- Observe **strong scaling** (fixed problem size, increase processors)
+- Observe **weak scaling** (increase both problem size and processors proportionally)
