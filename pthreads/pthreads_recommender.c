@@ -223,3 +223,98 @@ static void *thread_similarities(void *arg)
 
     return NULL;
 }
+/* Similarity pair */
+typedef struct {
+    int idx;
+    float val;
+} SimPair;
+
+/* Sorting comparator */
+static int cmp_sim_desc(const void *a, const void *b)
+{
+    float fa = ((const SimPair *)a)->val;
+    float fb = ((const SimPair *)b)->val;
+
+    return (fb > fa) - (fb < fa);
+}
+
+/* Prediction phase */
+static void *thread_predictions(void *arg)
+{
+    ThreadArgs *a = (ThreadArgs *)arg;
+
+    int start, end;
+    work_range(N_USERS, a->tid, a->nthreads, &start, &end);
+
+    SimPair *nbrs =
+        (SimPair *)malloc(N_USERS * sizeof(SimPair));
+
+    if (!nbrs) {
+        fprintf(stderr, "malloc failed\n");
+        return NULL;
+    }
+
+    for (int u = start; u < end; u++) {
+
+        for (int item = 0; item < N_ITEMS; item++) {
+
+            if (R(u, item) != 0.0f) {
+                PRED(u, item) = R(u, item);
+                continue;
+            }
+
+            int cnt = 0;
+
+            for (int v = 0; v < N_USERS; v++) {
+
+                if (v == u || R(v, item) == 0.0f)
+                    continue;
+
+                float s = SIM(u, v);
+
+                if (s <= 0.0f)
+                    continue;
+
+                nbrs[cnt].idx = v;
+                nbrs[cnt].val = s;
+                cnt++;
+            }
+
+            if (cnt == 0) {
+                PRED(u, item) = user_mean[u];
+                continue;
+            }
+
+            qsort(nbrs, cnt, sizeof(SimPair), cmp_sim_desc);
+
+            int k = (cnt < TOP_K) ? cnt : TOP_K;
+
+            double num = 0.0;
+            double den = 0.0;
+
+            for (int j = 0; j < k; j++) {
+
+                float s = nbrs[j].val;
+
+                num += s *
+                       (R(nbrs[j].idx, item)
+                        - user_mean[nbrs[j].idx]);
+
+                den += s;
+            }
+
+            float pred = (den > 1e-10)
+                         ? user_mean[u] + (float)(num / den)
+                         : user_mean[u];
+
+            if (pred < 1.0f) pred = 1.0f;
+            if (pred > 5.0f) pred = 5.0f;
+
+            PRED(u, item) = pred;
+        }
+    }
+
+    free(nbrs);
+
+    return NULL;
+}
