@@ -318,3 +318,98 @@ static void *thread_predictions(void *arg)
 
     return NULL;
 }
+/* Evaluation */
+static float evaluate_mae(void)
+{
+    if (test_size == 0)
+        return 0.0f;
+
+    double err = 0.0;
+
+    for (int t = 0; t < test_size; t++) {
+
+        err += fabs(
+            PRED(test_set[t].user, test_set[t].item)
+            - test_set[t].rating
+        );
+    }
+
+    return (float)(err / test_size);
+}
+
+/* Similarity checksum */
+static double similarity_checksum(void)
+{
+    double s = 0.0;
+
+    for (int u = 0; u < N_USERS; u++) {
+        for (int v = 0; v < N_USERS; v++) {
+            s += SIM(u, v);
+        }
+    }
+
+    return s;
+}
+
+/* Parallel runner */
+static double run_parallel(void *(*fn)(void *),
+                           pthread_t *threads,
+                           ThreadArgs *args)
+{
+    double t0 = now_sec();
+
+    for (int t = 0; t < N_THREADS; t++) {
+
+        args[t].tid = t;
+        args[t].nthreads = N_THREADS;
+
+        pthread_create(&threads[t], NULL, fn, &args[t]);
+    }
+
+    for (int t = 0; t < N_THREADS; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    return now_sec() - t0;
+}
+
+/* Main */
+int main(int argc, char *argv[])
+{
+    N_USERS =
+        (argc >= 2) ? atoi(argv[1]) : DEFAULT_USERS;
+
+    N_ITEMS =
+        (argc >= 3) ? atoi(argv[2]) : DEFAULT_ITEMS;
+
+    N_THREADS =
+        (argc >= 4) ? atoi(argv[3]) : DEFAULT_THREADS;
+
+    pthread_t threads[MAX_THREADS];
+    ThreadArgs args[MAX_THREADS];
+
+    alloc_arrays();
+
+    generate_data();
+
+    run_parallel(thread_user_means, threads, args);
+
+    double t_sim =
+        run_parallel(thread_similarities, threads, args);
+
+    printf("Similarity Time: %.4f s\n", t_sim);
+
+    printf("Checksum: %.6f\n",
+           similarity_checksum());
+
+    double t_pred =
+        run_parallel(thread_predictions, threads, args);
+
+    printf("Prediction Time: %.4f s\n", t_pred);
+
+    printf("MAE: %.4f\n", evaluate_mae());
+
+    free_arrays();
+
+    return 0;
+}
