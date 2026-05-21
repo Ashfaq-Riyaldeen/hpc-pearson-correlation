@@ -127,3 +127,289 @@ static void generate_data(void)
     printf("[Data] Users: %d | Items: %d | Test ratings: %d\n",
            N_USERS, N_ITEMS, test_size);
 }
+
+/* User mean computation */
+static void *thread_user_means(void *arg)
+{
+    ThreadArgs *a = (ThreadArgs *)arg;
+
+    int start, end;
+    work_range(N_USERS, a->tid, a->nthreads, &start, &end);
+
+    for (int u = start; u < end; u++) {
+
+        double sum = 0.0;
+        int cnt = 0;
+
+        for (int i = 0; i < N_ITEMS; i++) {
+
+            if (R(u, i) != 0.0f) {
+                sum += R(u, i);
+                cnt++;
+            }
+        }
+
+        user_mean[u] = (cnt > 0)
+                       ? (float)(sum / cnt)
+                       : 3.0f;
+    }
+
+    return NULL;
+}
+
+/* Pearson similarity */
+static float pearson_similarity(int u, int v)
+{
+    double num = 0.0;
+    double den_u = 0.0;
+    double den_v = 0.0;
+
+    int co = 0;
+
+    float mu = user_mean[u];
+    float mv = user_mean[v];
+
+    for (int i = 0; i < N_ITEMS; i++) {
+
+        if (R(u, i) != 0.0f && R(v, i) != 0.0f) {
+
+            double du = R(u, i) - mu;
+            double dv = R(v, i) - mv;
+
+            num += du * dv;
+            den_u += du * du;
+            den_v += dv * dv;
+
+            co++;
+        }
+    }
+
+    if (co < 2)
+        return 0.0f;
+
+    double denom = sqrt(den_u) * sqrt(den_v);
+
+    if (denom < 1e-10)
+        return 0.0f;
+
+    float s = (float)(num / denom);
+
+    if (s > 1.0f) s = 1.0f;
+    if (s < -1.0f) s = -1.0f;
+
+    return s;
+}
+
+/* Similarity matrix */
+static void *thread_similarities(void *arg)
+{
+    ThreadArgs *a = (ThreadArgs *)arg;
+
+    int start, end;
+    work_range(N_USERS, a->tid, a->nthreads, &start, &end);
+
+    for (int u = start; u < end; u++) {
+
+        SIM(u, u) = 1.0f;
+
+        for (int v = u + 1; v < N_USERS; v++) {
+
+            float s = pearson_similarity(u, v);
+
+            SIM(u, v) = s;
+            SIM(v, u) = s;
+        }
+    }
+
+    return NULL;
+}
+/* Similarity pair */
+typedef struct {
+    int idx;
+    float val;
+} SimPair;
+
+/* Sorting comparator */
+static int cmp_sim_desc(const void *a, const void *b)
+{
+    float fa = ((const SimPair *)a)->val;
+    float fb = ((const SimPair *)b)->val;
+
+    return (fb > fa) - (fb < fa);
+}
+
+/* Prediction phase */
+static void *thread_predictions(void *arg)
+{
+    ThreadArgs *a = (ThreadArgs *)arg;
+
+    int start, end;
+    work_range(N_USERS, a->tid, a->nthreads, &start, &end);
+
+    SimPair *nbrs =
+        (SimPair *)malloc(N_USERS * sizeof(SimPair));
+
+    if (!nbrs) {
+        fprintf(stderr, "malloc failed\n");
+        return NULL;
+    }
+
+    for (int u = start; u < end; u++) {
+
+        for (int item = 0; item < N_ITEMS; item++) {
+
+            if (R(u, item) != 0.0f) {
+                PRED(u, item) = R(u, item);
+                continue;
+            }
+
+            int cnt = 0;
+
+            for (int v = 0; v < N_USERS; v++) {
+
+                if (v == u || R(v, item) == 0.0f)
+                    continue;
+
+                float s = SIM(u, v);
+
+                if (s <= 0.0f)
+                    continue;
+
+                nbrs[cnt].idx = v;
+                nbrs[cnt].val = s;
+                cnt++;
+            }
+
+            if (cnt == 0) {
+                PRED(u, item) = user_mean[u];
+                continue;
+            }
+
+            qsort(nbrs, cnt, sizeof(SimPair), cmp_sim_desc);
+
+            int k = (cnt < TOP_K) ? cnt : TOP_K;
+
+            double num = 0.0;
+            double den = 0.0;
+
+            for (int j = 0; j < k; j++) {
+
+                float s = nbrs[j].val;
+
+                num += s *
+                       (R(nbrs[j].idx, item)
+                        - user_mean[nbrs[j].idx]);
+
+                den += s;
+            }
+
+            float pred = (den > 1e-10)
+                         ? user_mean[u] + (float)(num / den)
+                         : user_mean[u];
+
+            if (pred < 1.0f) pred = 1.0f;
+            if (pred > 5.0f) pred = 5.0f;
+
+            PRED(u, item) = pred;
+        }
+    }
+
+    free(nbrs);
+
+    return NULL;
+}
+/* Evaluation */
+static float evaluate_mae(void)
+{
+    if (test_size == 0)
+        return 0.0f;
+
+    double err = 0.0;
+
+    for (int t = 0; t < test_size; t++) {
+
+        err += fabs(
+            PRED(test_set[t].user, test_set[t].item)
+            - test_set[t].rating
+        );
+    }
+
+    return (float)(err / test_size);
+}
+
+/* Similarity checksum */
+static double similarity_checksum(void)
+{
+    double s = 0.0;
+
+    for (int u = 0; u < N_USERS; u++) {
+        for (int v = 0; v < N_USERS; v++) {
+            s += SIM(u, v);
+        }
+    }
+
+    return s;
+}
+
+/* Parallel runner */
+static double run_parallel(void *(*fn)(void *),
+                           pthread_t *threads,
+                           ThreadArgs *args)
+{
+    double t0 = now_sec();
+
+    for (int t = 0; t < N_THREADS; t++) {
+
+        args[t].tid = t;
+        args[t].nthreads = N_THREADS;
+
+        pthread_create(&threads[t], NULL, fn, &args[t]);
+    }
+
+    for (int t = 0; t < N_THREADS; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    return now_sec() - t0;
+}
+
+/* Main */
+int main(int argc, char *argv[])
+{
+    N_USERS =
+        (argc >= 2) ? atoi(argv[1]) : DEFAULT_USERS;
+
+    N_ITEMS =
+        (argc >= 3) ? atoi(argv[2]) : DEFAULT_ITEMS;
+
+    N_THREADS =
+        (argc >= 4) ? atoi(argv[3]) : DEFAULT_THREADS;
+
+    pthread_t threads[MAX_THREADS];
+    ThreadArgs args[MAX_THREADS];
+
+    alloc_arrays();
+
+    generate_data();
+
+    run_parallel(thread_user_means, threads, args);
+
+    double t_sim =
+        run_parallel(thread_similarities, threads, args);
+
+    printf("Similarity Time: %.4f s\n", t_sim);
+
+    printf("Checksum: %.6f\n",
+           similarity_checksum());
+
+    double t_pred =
+        run_parallel(thread_predictions, threads, args);
+
+    printf("Prediction Time: %.4f s\n", t_pred);
+
+    printf("MAE: %.4f\n", evaluate_mae());
+
+    free_arrays();
+
+    return 0;
+}
