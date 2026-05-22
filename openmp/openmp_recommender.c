@@ -55,7 +55,7 @@ static void alloc_arrays(void)
         exit(EXIT_FAILURE);
     }
 }
-
+/* Free all dynamically allocated memory used in the recommender system */
 static void free_arrays(void)
 {
     free(ratings);
@@ -137,7 +137,9 @@ static float pearson_similarity(int u, int v)
     if (s < -1.0f) s = -1.0f;
     return s;
 }
-
+/* Compute full user-user similarity matrix using OpenMP parallelism.
+ * Diagonal entries are set to 1.0, and only upper triangle is computed
+ * then mirrored to maintain symmetry. */
 static void compute_all_similarities(void)
 {
     #pragma omp parallel for schedule(static)
