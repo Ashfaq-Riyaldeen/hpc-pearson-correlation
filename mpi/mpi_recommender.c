@@ -296,6 +296,8 @@ static float pearson_similarity(int u, int v)
     return s;
 }
 
+
+/* Compute similarity rows assigned to this MPI process */
 static void compute_all_similarities(int start_u, int end_u,
                                       int *recvcounts, int *displs)
 {
@@ -348,7 +350,7 @@ static int cmp_sim_desc(const void *a, const void *b)
     float fb = ((const SimPair *)b)->val;
     return (fb > fa) - (fb < fa);
 }
-
+/* Compute Top-K collaborative filtering predictions for assigned users */
 static void compute_all_predictions(int start_u, int end_u)
 {
     SimPair *nbrs = (SimPair *)malloc(N_USERS * sizeof(SimPair));
@@ -490,6 +492,8 @@ int main(int argc, char *argv[])
     N_USERS = (argc >= 2) ? atoi(argv[1]) : DEFAULT_USERS;
     N_ITEMS = (argc >= 3) ? atoi(argv[2]) : DEFAULT_ITEMS;
 
+
+    /* Validate input arguments and exit if dataset size is invalid */
     if (N_USERS <= 0 || N_ITEMS <= 0) {
         if (mpi_rank == 0)
             fprintf(stderr, "Usage: %s [num_users] [num_items]\n", argv[0]);
@@ -616,7 +620,7 @@ int main(int argc, char *argv[])
             printf("\n");
         }
     }
-
+/* Free MPI helper arrays and main data structures before shutdown */
     free(mean_recvcounts); free(mean_displs);
     free(sim_recvcounts);  free(sim_displs);
     free_arrays();
