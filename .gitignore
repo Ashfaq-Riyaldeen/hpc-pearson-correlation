@@ -37,6 +37,9 @@ cuda_rec
 *.snm
 *.vrb
 
+# LaTeX-generated PDF output (analysis_report/)
+analysis_report/analysis_report.pdf
+
 # Python cache (analysis_diagrams/generate_charts.py)
 __pycache__/
 *.py[cod]
