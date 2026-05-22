@@ -1,7 +1,3 @@
- /* Compile:
- *   gcc -O2 -fopenmp -o openmp_rec openmp_recommender.c -lm
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,94 +5,79 @@
 #include <time.h>
 #include <omp.h>
 
-/* ── Fixed parameters ────────────────────────────────────────────────────── */
 #define DEFAULT_USERS  1000
 #define DEFAULT_ITEMS  1000
-#define SPARSITY       0.70f   /* fraction of entries left unrated            */
-#define TOP_K            20    /* neighbours used in prediction               */
-#define SEED             42    /* RNG seed for reproducibility                */
-#define TEST_RATIO      0.10f  /* fraction of known ratings held out for MAE  */
+#define SPARSITY       0.70f
+#define TOP_K            20
+#define SEED             42
+#define TEST_RATIO      0.10f
 
-/* ── Runtime size variables (set in main) ────────────────────────────────── */
 static int N_USERS;
 static int N_ITEMS;
 
-/*
- * All matrices stored as flat 1-D arrays (dynamic allocation).
- * Access: ratings[u * N_ITEMS + i]
- */
-static float *ratings;      /* [N_USERS × N_ITEMS] – 0 = unrated             */
-static float *user_mean;    /* [N_USERS]                                      */
-static float *sim_matrix;   /* [N_USERS × N_USERS]                           */
-static float *predictions;  /* [N_USERS × N_ITEMS]                           */
+static float *ratings;
+static float *user_mean;
+static float *sim_matrix;
+static float *predictions;
 
 typedef struct { int user; int item; float rating; } TestEntry;
 static TestEntry *test_set;
 static int        test_size;
 
-/* ── Convenience macros ──────────────────────────────────────────────────── */
-#define R(u,i)    ratings[(u)*N_ITEMS + (i)]
-#define SIM(u,v)  sim_matrix[(u)*N_USERS + (v)]
-#define PRED(u,i) predictions[(u)*N_ITEMS + (i)]
+#define R(u,i)    ratings[(size_t)(u)*N_ITEMS  + (i)]
+#define SIM(u,v)  sim_matrix[(size_t)(u)*N_USERS + (v)]
+#define PRED(u,i) predictions[(size_t)(u)*N_ITEMS + (i)]
 
-/* ── Timing ──────────────────────────────────────────────────────────────── */
 static inline double now_sec(void) { return omp_get_wtime(); }
 
-/* ── Phase 1: Allocate memory ────────────────────────────────────────────── */
 static void alloc_arrays(void)
 {
-    ratings     = (float *)calloc(N_USERS * N_ITEMS, sizeof(float));
-    user_mean   = (float *)calloc(N_USERS,            sizeof(float));
-    sim_matrix  = (float *)calloc(N_USERS * N_USERS,  sizeof(float));
-    predictions = (float *)calloc(N_USERS * N_ITEMS,  sizeof(float));
+    ratings     = (float *)calloc((size_t)N_USERS * N_ITEMS, sizeof(float));
+    user_mean   = (float *)calloc(N_USERS,                    sizeof(float));
+    sim_matrix  = (float *)calloc((size_t)N_USERS * N_USERS,  sizeof(float));
+    predictions = (float *)calloc((size_t)N_USERS * N_ITEMS,  sizeof(float));
 
     if (!ratings || !user_mean || !sim_matrix || !predictions) {
         fprintf(stderr, "Error: memory allocation failed.\n");
         exit(EXIT_FAILURE);
     }
 }
-/* Free all dynamically allocated memory used in the recommender system */
+
 static void free_arrays(void)
 {
-    free(ratings);
-    free(user_mean);
-    free(sim_matrix);
-    free(predictions);
+    free(ratings); free(user_mean);
+    free(sim_matrix); free(predictions);
     free(test_set);
 }
 
-/* ── Phase 2: Data generation (serial – identical seed to baseline) ──────── */
 static void generate_data(void)
 {
     srand(SEED);
 
-    int capacity = (int)(N_USERS * N_ITEMS * (1.0f - SPARSITY)) + 1000;
+    int capacity = (int)((size_t)N_USERS * N_ITEMS * (1.0f - SPARSITY)) + 1000;
     test_set  = (TestEntry *)malloc(capacity * sizeof(TestEntry));
     test_size = 0;
 
     for (int u = 0; u < N_USERS; u++) {
         for (int i = 0; i < N_ITEMS; i++) {
             if ((float)rand() / RAND_MAX < SPARSITY) continue;
-
             float rating = (float)(rand() % 5) + 1.0f;
-
             if ((float)rand() / RAND_MAX < TEST_RATIO && test_size < capacity) {
                 test_set[test_size].user   = u;
                 test_set[test_size].item   = i;
                 test_set[test_size].rating = rating;
                 test_size++;
-                /* leave R(u,i) = 0 → treated as unrated */
             } else {
                 R(u, i) = rating;
             }
         }
     }
 
-    printf("[Data]   Users: %d | Items: %d | Sparsity: %.0f%% | Test ratings: %d\n",
+    printf("[Data]   Users: %d | Items: %d | Sparsity: %.0f%% | "
+           "Test ratings: %d\n",
            N_USERS, N_ITEMS, SPARSITY * 100.0f, test_size);
 }
 
-/* ── Phase 3: User means – PARALLEL ─────────────────────────────────────── */
 static void compute_user_means(void)
 {
     #pragma omp parallel for schedule(static)
@@ -110,7 +91,6 @@ static void compute_user_means(void)
     }
 }
 
-/* ── Phase 4: Similarity matrix – PARALLEL ───────────────────────────────── */
 static float pearson_similarity(int u, int v)
 {
     double num = 0.0, den_u = 0.0, den_v = 0.0;
@@ -137,9 +117,7 @@ static float pearson_similarity(int u, int v)
     if (s < -1.0f) s = -1.0f;
     return s;
 }
-/* Compute full user-user similarity matrix using OpenMP parallelism.
- * Diagonal entries are set to 1.0, and only upper triangle is computed
- * then mirrored to maintain symmetry. */
+
 static void compute_all_similarities(void)
 {
     #pragma omp parallel for schedule(static)
@@ -156,7 +134,6 @@ static void compute_all_similarities(void)
     }
 }
 
-/* ── Phase 5: Predictions – PARALLEL ────────────────────────────────────── */
 typedef struct { int idx; float val; } SimPair;
 
 static int cmp_sim_desc(const void *a, const void *b)
@@ -175,6 +152,7 @@ static void compute_all_predictions(void)
         #pragma omp for schedule(dynamic, 2)
         for (int u = 0; u < N_USERS; u++) {
             for (int item = 0; item < N_ITEMS; item++) {
+
                 if (R(u, item) != 0.0f) {
                     PRED(u, item) = R(u, item);
                     continue;
@@ -215,15 +193,28 @@ static void compute_all_predictions(void)
     }
 }
 
-/* ── Phase 6: Evaluation ─────────────────────────────────────────────────── */
 static float evaluate_mae(void)
 {
     if (test_size == 0) return 0.0f;
     double err = 0.0;
+
     #pragma omp parallel for reduction(+:err) schedule(static)
     for (int t = 0; t < test_size; t++)
         err += fabs(PRED(test_set[t].user, test_set[t].item) - test_set[t].rating);
+
     return (float)(err / test_size);
+}
+
+static float evaluate_rmse(void)
+{
+    if (test_size == 0) return 0.0f;
+    double sq = 0.0;
+    #pragma omp parallel for reduction(+:sq) schedule(static)
+    for (int t = 0; t < test_size; t++) {
+        double d = PRED(test_set[t].user, test_set[t].item) - test_set[t].rating;
+        sq += d * d;
+    }
+    return (float)sqrt(sq / test_size);
 }
 
 static double similarity_checksum(void)
@@ -236,10 +227,8 @@ static double similarity_checksum(void)
     return s;
 }
 
-/* ── Main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[])
 {
-    /* Parse optional CLI args: ./openmp_rec [num_users] [num_items] */
     N_USERS = (argc >= 2) ? atoi(argv[1]) : DEFAULT_USERS;
     N_ITEMS = (argc >= 3) ? atoi(argv[2]) : DEFAULT_ITEMS;
 
@@ -263,29 +252,42 @@ int main(int argc, char *argv[])
 
     alloc_arrays();
 
-    t0 = now_sec(); generate_data();          t1 = now_sec();
+    t0 = now_sec();
+    generate_data();
+    t1 = now_sec();
     printf("[Timing] Data generation    : %.4f s\n", t1 - t0);
 
-    t0 = now_sec(); compute_user_means();     t1 = now_sec();
-    printf("[Timing] User mean compute  : %.4f s  [parallel, %d threads]\n", t1-t0, nthreads);
+    t0 = now_sec();
+    compute_user_means();
+    t1 = now_sec();
+    printf("[Timing] User mean compute  : %.4f s  [parallel, %d threads]\n",
+           t1 - t0, nthreads);
 
-    t0 = now_sec(); compute_all_similarities(); t1 = now_sec();
+    t0 = now_sec();
+    compute_all_similarities();
+    t1 = now_sec();
     t_sim = t1 - t0;
-    printf("[Timing] Similarity matrix  : %.4f s  [parallel, %d threads]\n", t_sim, nthreads);
+    printf("[Timing] Similarity matrix  : %.4f s  [parallel, %d threads]\n",
+           t_sim, nthreads);
     printf("[Check]  Sim-matrix checksum: %.6f\n", similarity_checksum());
 
-    t0 = now_sec(); compute_all_predictions(); t1 = now_sec();
+    t0 = now_sec();
+    compute_all_predictions();
+    t1 = now_sec();
     t_pred = t1 - t0;
-    printf("[Timing] Prediction phase   : %.4f s  [parallel, %d threads]\n", t_pred, nthreads);
+    printf("[Timing] Prediction phase   : %.4f s  [parallel, %d threads]\n",
+           t_pred, nthreads);
 
     printf("[Eval]   MAE on test set    : %.4f  (test size: %d)\n",
            evaluate_mae(), test_size);
+    printf("[Eval]   RMSE on test set   : %.4f  (test size: %d)\n",
+           evaluate_rmse(), test_size);
     printf("[Timing] Total (sim+pred)   : %.4f s\n", t_sim + t_pred);
 
-    /* Sample output */
     int show_u = (N_USERS < 5) ? N_USERS : 5;
     int show_i = (N_ITEMS < 5) ? N_ITEMS : 5;
-    printf("\n--- Sample Predictions (first %d users, %d items) ---\n", show_u, show_i);
+    printf("\n--- Sample Predictions (first %d users, %d items) ---\n",
+           show_u, show_i);
     printf("%-9s", "User\\Item");
     for (int i = 0; i < show_i; i++) printf("  Item%-3d", i);
     printf("\n");

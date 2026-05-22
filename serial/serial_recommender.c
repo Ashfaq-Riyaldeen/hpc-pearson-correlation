@@ -4,7 +4,6 @@
 #include <math.h>
 #include <time.h>
 
-/* ── Fixed parameters ────────────────────────────────────────────────────── */
 #define DEFAULT_USERS  1000
 #define DEFAULT_ITEMS  1000
 #define SPARSITY       0.70f
@@ -12,25 +11,22 @@
 #define SEED             42
 #define TEST_RATIO      0.10f
 
-/* ── Runtime size variables (set in main) ────────────────────────────────── */
 static int N_USERS;
 static int N_ITEMS;
 
-static float *ratings;      /* [N_USERS × N_ITEMS] – 0 = unrated             */
-static float *user_mean;    /* [N_USERS]                                      */
-static float *sim_matrix;   /* [N_USERS × N_USERS]                           */
-static float *predictions;  /* [N_USERS × N_ITEMS]                           */
+static float *ratings;
+static float *user_mean;
+static float *sim_matrix;
+static float *predictions;
 
 typedef struct { int user; int item; float rating; } TestEntry;
 static TestEntry *test_set;
 static int        test_size;
 
-/* ── Convenience macros ──────────────────────────────────────────────────── */
-#define R(u,i)    ratings[(u)*N_ITEMS + (i)]
-#define SIM(u,v)  sim_matrix[(u)*N_USERS + (v)]
-#define PRED(u,i) predictions[(u)*N_ITEMS + (i)]
+#define R(u,i)    ratings[(size_t)(u)*N_ITEMS  + (i)]
+#define SIM(u,v)  sim_matrix[(size_t)(u)*N_USERS + (v)]
+#define PRED(u,i) predictions[(size_t)(u)*N_ITEMS + (i)]
 
-/* ── Timing ──────────────────────────────────────────────────────────────── */
 static double now_sec(void)
 {
     struct timespec ts;
@@ -38,13 +34,12 @@ static double now_sec(void)
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* ── Allocate / free ─────────────────────────────────────────────────────── */
 static void alloc_arrays(void)
 {
-    ratings     = (float *)calloc(N_USERS * N_ITEMS, sizeof(float));
-    user_mean   = (float *)calloc(N_USERS,            sizeof(float));
-    sim_matrix  = (float *)calloc(N_USERS * N_USERS,  sizeof(float));
-    predictions = (float *)calloc(N_USERS * N_ITEMS,  sizeof(float));
+    ratings     = (float *)calloc((size_t)N_USERS * N_ITEMS, sizeof(float));
+    user_mean   = (float *)calloc(N_USERS,                    sizeof(float));
+    sim_matrix  = (float *)calloc((size_t)N_USERS * N_USERS,  sizeof(float));
+    predictions = (float *)calloc((size_t)N_USERS * N_ITEMS,  sizeof(float));
 
     if (!ratings || !user_mean || !sim_matrix || !predictions) {
         fprintf(stderr, "Error: memory allocation failed.\n");
@@ -61,21 +56,18 @@ static void free_arrays(void)
     free(test_set);
 }
 
-/* ── Phase 1: Data generation ────────────────────────────────────────────── */
 static void generate_data(void)
 {
     srand(SEED);
 
-    int capacity = (int)(N_USERS * N_ITEMS * (1.0f - SPARSITY)) + 1000;
+    int capacity = (int)((size_t)N_USERS * N_ITEMS * (1.0f - SPARSITY)) + 1000;
     test_set  = (TestEntry *)malloc(capacity * sizeof(TestEntry));
     test_size = 0;
 
     for (int u = 0; u < N_USERS; u++) {
         for (int i = 0; i < N_ITEMS; i++) {
             if ((float)rand() / RAND_MAX < SPARSITY) continue;
-
             float rating = (float)(rand() % 5) + 1.0f;
-
             if ((float)rand() / RAND_MAX < TEST_RATIO && test_size < capacity) {
                 test_set[test_size].user   = u;
                 test_set[test_size].item   = i;
@@ -92,25 +84,29 @@ static void generate_data(void)
            N_USERS, N_ITEMS, SPARSITY * 100.0f, test_size);
 }
 
-/* ── Phase 2: User means ─────────────────────────────────────────────────── */
 static void compute_user_means(void)
 {
     for (int u = 0; u < N_USERS; u++) {
         double sum = 0.0;
         int    cnt = 0;
         for (int i = 0; i < N_ITEMS; i++) {
-            if (R(u, i) != 0.0f) { sum += R(u, i); cnt++; }
+            if (R(u, i) != 0.0f) {
+                sum += R(u, i);
+                cnt++;
+            }
         }
         user_mean[u] = (cnt > 0) ? (float)(sum / cnt) : 3.0f;
     }
 }
 
-/* ── Phase 3: Pearson similarity ─────────────────────────────────────────── */
 static float pearson_similarity(int u, int v)
 {
-    double num = 0.0, den_u = 0.0, den_v = 0.0;
+    double num = 0.0;
+    double den_u = 0.0;
+    double den_v = 0.0;
     int    co  = 0;
-    float  mu  = user_mean[u], mv = user_mean[v];
+    float  mu  = user_mean[u];
+    float  mv  = user_mean[v];
 
     for (int i = 0; i < N_ITEMS; i++) {
         if (R(u, i) != 0.0f && R(v, i) != 0.0f) {
@@ -124,6 +120,7 @@ static float pearson_similarity(int u, int v)
     }
 
     if (co < 2) return 0.0f;
+
     double denom = sqrt(den_u) * sqrt(den_v);
     if (denom < 1e-10) return 0.0f;
 
@@ -147,7 +144,6 @@ static void compute_all_similarities(void)
     }
 }
 
-/* ── Phase 4: Predictions ────────────────────────────────────────────────── */
 typedef struct { int idx; float val; } SimPair;
 
 static int cmp_sim_desc(const void *a, const void *b)
@@ -163,11 +159,13 @@ static void compute_all_predictions(void)
 
     for (int u = 0; u < N_USERS; u++) {
         for (int item = 0; item < N_ITEMS; item++) {
+
             if (R(u, item) != 0.0f) { PRED(u, item) = R(u, item); continue; }
 
             int cnt = 0;
             for (int v = 0; v < N_USERS; v++) {
-                if (v == u || R(v, item) == 0.0f) continue;
+                if (v == u) continue;
+                if (R(v, item) == 0.0f) continue;
                 float s = SIM(u, v);
                 if (s <= 0.0f) continue;
                 nbrs[cnt].idx = v;
@@ -190,6 +188,7 @@ static void compute_all_predictions(void)
             float pred = (den > 1e-10)
                          ? user_mean[u] + (float)(num / den)
                          : user_mean[u];
+
             if (pred < 1.0f) pred = 1.0f;
             if (pred > 5.0f) pred = 5.0f;
             PRED(u, item) = pred;
@@ -199,7 +198,6 @@ static void compute_all_predictions(void)
     free(nbrs);
 }
 
-/* ── Phase 5: Evaluation ─────────────────────────────────────────────────── */
 static float evaluate_mae(void)
 {
     if (test_size == 0) return 0.0f;
@@ -207,6 +205,17 @@ static float evaluate_mae(void)
     for (int t = 0; t < test_size; t++)
         err += fabs(PRED(test_set[t].user, test_set[t].item) - test_set[t].rating);
     return (float)(err / test_size);
+}
+
+static float evaluate_rmse(void)
+{
+    if (test_size == 0) return 0.0f;
+    double sq = 0.0;
+    for (int t = 0; t < test_size; t++) {
+        double d = PRED(test_set[t].user, test_set[t].item) - test_set[t].rating;
+        sq += d * d;
+    }
+    return (float)sqrt(sq / test_size);
 }
 
 static double similarity_checksum(void)
@@ -218,7 +227,6 @@ static double similarity_checksum(void)
     return s;
 }
 
-/* ── Main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[])
 {
     N_USERS = (argc >= 2) ? atoi(argv[1]) : DEFAULT_USERS;
@@ -237,29 +245,39 @@ int main(int argc, char *argv[])
 
     alloc_arrays();
 
-    t0 = now_sec(); generate_data();            t1 = now_sec();
+    t0 = now_sec();
+    generate_data();
+    t1 = now_sec();
     printf("[Timing] Data generation    : %.4f s\n", t1 - t0);
 
-    t0 = now_sec(); compute_user_means();       t1 = now_sec();
+    t0 = now_sec();
+    compute_user_means();
+    t1 = now_sec();
     printf("[Timing] User mean compute  : %.4f s\n", t1 - t0);
 
-    t0 = now_sec(); compute_all_similarities(); t1 = now_sec();
+    t0 = now_sec();
+    compute_all_similarities();
+    t1 = now_sec();
     t_sim = t1 - t0;
     printf("[Timing] Similarity matrix  : %.4f s\n", t_sim);
     printf("[Check]  Sim-matrix checksum: %.6f\n", similarity_checksum());
 
-    t0 = now_sec(); compute_all_predictions();  t1 = now_sec();
+    t0 = now_sec();
+    compute_all_predictions();
+    t1 = now_sec();
     t_pred = t1 - t0;
     printf("[Timing] Prediction phase   : %.4f s\n", t_pred);
 
     printf("[Eval]   MAE on test set    : %.4f  (test size: %d)\n",
            evaluate_mae(), test_size);
+    printf("[Eval]   RMSE on test set   : %.4f  (test size: %d)\n",
+           evaluate_rmse(), test_size);
     printf("[Timing] Total (sim+pred)   : %.4f s\n", t_sim + t_pred);
 
-    /* Sample output */
     int show_u = (N_USERS < 5) ? N_USERS : 5;
     int show_i = (N_ITEMS < 5) ? N_ITEMS : 5;
-    printf("\n--- Sample Predictions (first %d users, %d items) ---\n", show_u, show_i);
+    printf("\n--- Sample Predictions (first %d users, %d items) ---\n",
+           show_u, show_i);
     printf("%-9s", "User\\Item");
     for (int i = 0; i < show_i; i++) printf("  Item%-3d", i);
     printf("\n");
