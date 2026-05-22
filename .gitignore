@@ -1,0 +1,57 @@
+# Compiled executables (built per README §"Build & run each version individually")
+serial_rec
+openmp_rec
+pthreads_rec
+mpi_rec
+hybrid_rec
+cuda_rec
+*.exe
+
+# Object / intermediate build files
+*.o
+*.obj
+*.out
+*.a
+*.so
+*.dll
+*.dylib
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# LaTeX intermediates (analysis_report/)
+*.aux
+*.log
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*.nav
+*.snm
+*.vrb
+
+# Python cache (analysis_diagrams/generate_charts.py)
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/
