@@ -83,11 +83,13 @@ static void generate_data(void)
     }
 
     if (mpi_rank == 0)
-        printf("[Data]   Users: %d | Items: %d | Sparsity: %.0f%% | Test ratings: %d\n",
+        printf("[Data]   Users: %d | Items: %d | Sparsity: %.0f%% | "
+               "Test ratings: %d\n",
                N_USERS, N_ITEMS, SPARSITY * 100.0f, test_size);
 }
 
-static void compute_user_means(int start_u, int end_u, int *recvcounts, int *displs)
+static void compute_user_means(int start_u, int end_u,
+                                int *recvcounts, int *displs)
 {
     #pragma omp parallel for schedule(static)
     for (int u = start_u; u < end_u; u++) {
@@ -133,7 +135,8 @@ static float pearson_similarity(int u, int v)
     return s;
 }
 
-static void compute_all_similarities(int start_u, int end_u, int *recvcounts, int *displs)
+static void compute_all_similarities(int start_u, int end_u,
+                                      int *recvcounts, int *displs)
 {
     #pragma omp parallel for schedule(dynamic, 4)
     for (int u = start_u; u < end_u; u++) {
@@ -175,6 +178,7 @@ static void compute_all_predictions(int start_u, int end_u)
         #pragma omp for schedule(dynamic, 2)
         for (int u = start_u; u < end_u; u++) {
             for (int item = 0; item < N_ITEMS; item++) {
+
                 if (R(u, item) != 0.0f) { PRED(u, item) = R(u, item); continue; }
 
                 int cnt = 0;
@@ -199,7 +203,9 @@ static void compute_all_predictions(int start_u, int end_u)
                     den += s;
                 }
 
-                float pred = (den > 1e-10) ? user_mean[u] + (float)(num / den) : user_mean[u];
+                float pred = (den > 1e-10)
+                             ? user_mean[u] + (float)(num / den)
+                             : user_mean[u];
                 if (pred < 1.0f) pred = 1.0f;
                 if (pred > 5.0f) pred = 5.0f;
                 PRED(u, item) = pred;
@@ -231,6 +237,31 @@ static float evaluate_mae(int start_u, int end_u)
 
     if (mpi_rank == 0 && global_cnt > 0)
         return (float)(global_err / global_cnt);
+    return 0.0f;
+}
+
+static float evaluate_rmse(int start_u, int end_u)
+{
+    double local_sq  = 0.0;
+    int    local_cnt = 0;
+
+    #pragma omp parallel for reduction(+:local_sq, local_cnt) schedule(static)
+    for (int t = 0; t < test_size; t++) {
+        int u = test_set[t].user;
+        if (u < start_u || u >= end_u) continue;
+        double d = PRED(u, test_set[t].item) - test_set[t].rating;
+        local_sq += d * d;
+        local_cnt++;
+    }
+
+    double global_sq  = 0.0;
+    int    global_cnt = 0;
+
+    MPI_Reduce(&local_sq,  &global_sq,  1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_cnt, &global_cnt, 1, MPI_INT,    MPI_SUM, 0, MPI_COMM_WORLD);
+
+    if (mpi_rank == 0 && global_cnt > 0)
+        return (float)sqrt(global_sq / global_cnt);
     return 0.0f;
 }
 
@@ -273,7 +304,8 @@ int main(int argc, char *argv[])
     if (mpi_rank == 0) {
         printf("=== Pearson Correlation Recommender – Hybrid MPI+OpenMP Version ===\n");
         printf("    Users: %d | Items: %d | Top-K: %d\n", N_USERS, N_ITEMS, TOP_K);
-        printf("    MPI Processes: %d | OpenMP Threads/Process: %d | Total workers: %d\n\n",
+        printf("    MPI Processes: %d | OpenMP Threads/Process: %d"
+               " | Total workers: %d\n\n",
                mpi_size, omp_threads, mpi_size * omp_threads);
     }
 
@@ -310,8 +342,8 @@ int main(int argc, char *argv[])
     MPI_Barrier(MPI_COMM_WORLD);
     t1 = now_sec();
     if (mpi_rank == 0)
-        printf("[Timing] User mean compute  : %.4f s  [MPI %d × OMP %d]\n",
-               t1 - t0, mpi_size, omp_threads);
+        printf("[Timing] User mean compute  : %.4f s"
+               "  [MPI %d × OMP %d]\n", t1 - t0, mpi_size, omp_threads);
 
     MPI_Barrier(MPI_COMM_WORLD);
     t0 = now_sec();
@@ -319,8 +351,8 @@ int main(int argc, char *argv[])
     MPI_Barrier(MPI_COMM_WORLD);
     t_sim = now_sec() - t0;
     if (mpi_rank == 0) {
-        printf("[Timing] Similarity matrix  : %.4f s  [MPI %d × OMP %d]\n",
-               t_sim, mpi_size, omp_threads);
+        printf("[Timing] Similarity matrix  : %.4f s"
+               "  [MPI %d × OMP %d]\n", t_sim, mpi_size, omp_threads);
         printf("[Check]  Sim-matrix checksum: %.6f\n", similarity_checksum());
     }
 
@@ -330,19 +362,24 @@ int main(int argc, char *argv[])
     MPI_Barrier(MPI_COMM_WORLD);
     t_pred = now_sec() - t0;
     if (mpi_rank == 0)
-        printf("[Timing] Prediction phase   : %.4f s  [MPI %d × OMP %d]\n",
-               t_pred, mpi_size, omp_threads);
+        printf("[Timing] Prediction phase   : %.4f s"
+               "  [MPI %d × OMP %d]\n", t_pred, mpi_size, omp_threads);
 
-    float mae = evaluate_mae(start_u, end_u);
+    float mae  = evaluate_mae(start_u, end_u);
+    float rmse = evaluate_rmse(start_u, end_u);
     if (mpi_rank == 0) {
-        printf("[Eval]   MAE on test set    : %.4f  (test size: %d)\n", mae, test_size);
+        printf("[Eval]   MAE on test set    : %.4f  (test size: %d)\n",
+               mae, test_size);
+        printf("[Eval]   RMSE on test set   : %.4f  (test size: %d)\n",
+               rmse, test_size);
         printf("[Timing] Total (sim+pred)   : %.4f s\n", t_sim + t_pred);
     }
 
     if (mpi_rank == 0) {
         int show_u = (N_USERS < 5) ? N_USERS : 5;
         int show_i = (N_ITEMS < 5) ? N_ITEMS : 5;
-        printf("\n--- Sample Predictions (first %d users, %d items) ---\n", show_u, show_i);
+        printf("\n--- Sample Predictions (first %d users, %d items) ---\n",
+               show_u, show_i);
         printf("%-9s", "User\\Item");
         for (int i = 0; i < show_i; i++) printf("  Item%-3d", i);
         printf("\n");
