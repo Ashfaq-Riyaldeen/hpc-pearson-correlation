@@ -4,6 +4,22 @@
 #include <math.h>
 #include <time.h>
 
+/*
+ * Serial user-based collaborative filtering recommender.
+ *
+ * The program creates a synthetic sparse user-item ratings matrix, hides a
+ * small fraction of known ratings as a test set, and predicts missing ratings
+ * with Pearson-correlation neighbors.  It is the baseline implementation used
+ * for comparing the parallel OpenMP, Pthreads, MPI, hybrid, and CUDA versions.
+ *
+ * High-level flow:
+ *   1. Generate sparse ratings and hold out TEST_RATIO for evaluation.
+ *   2. Compute each user's mean rating.
+ *   3. Build the full user-user Pearson similarity matrix.
+ *   4. Predict unrated items from the TOP_K most similar positive neighbors.
+ *   5. Report MAE/RMSE and timing information.
+ */
+
 #define DEFAULT_USERS  1000
 #define DEFAULT_ITEMS  1000
 #define SPARSITY       0.70f
@@ -23,6 +39,8 @@ typedef struct { int user; int item; float rating; } TestEntry;
 static TestEntry *test_set;
 static int        test_size;
 
+/* Store matrices as one-dimensional row-major arrays for compact allocation
+ * and cache-friendly sequential access.  A zero rating means "unknown". */
 #define R(u,i)    ratings[(size_t)(u)*N_ITEMS  + (i)]
 #define SIM(u,v)  sim_matrix[(size_t)(u)*N_USERS + (v)]
 #define PRED(u,i) predictions[(size_t)(u)*N_ITEMS + (i)]
@@ -60,14 +78,20 @@ static void generate_data(void)
 {
     srand(SEED);
 
+    /* Approximate capacity for the held-out test ratings.  The exact number
+     * depends on random sparsity and TEST_RATIO, so a small margin is added. */
     int capacity = (int)((size_t)N_USERS * N_ITEMS * (1.0f - SPARSITY)) + 1000;
     test_set  = (TestEntry *)malloc(capacity * sizeof(TestEntry));
     test_size = 0;
 
     for (int u = 0; u < N_USERS; u++) {
         for (int i = 0; i < N_ITEMS; i++) {
+            /* Skip most cells to simulate a sparse real-world rating matrix. */
             if ((float)rand() / RAND_MAX < SPARSITY) continue;
             float rating = (float)(rand() % 5) + 1.0f;
+
+            /* Held-out ratings are not placed in ratings[]; they are used only
+             * after prediction to measure how close the estimates were. */
             if ((float)rand() / RAND_MAX < TEST_RATIO && test_size < capacity) {
                 test_set[test_size].user   = u;
                 test_set[test_size].item   = i;
@@ -95,6 +119,9 @@ static void compute_user_means(void)
                 cnt++;
             }
         }
+        /* Use the middle of the 1..5 rating scale when a user has no observed
+         * training ratings, which avoids division by zero and gives a neutral
+         * baseline for predictions. */
         user_mean[u] = (cnt > 0) ? (float)(sum / cnt) : 3.0f;
     }
 }
@@ -110,6 +137,8 @@ static float pearson_similarity(int u, int v)
 
     for (int i = 0; i < N_ITEMS; i++) {
         if (R(u, i) != 0.0f && R(v, i) != 0.0f) {
+            /* Pearson correlation compares how two users deviate from their
+             * own average ratings on items both users have rated. */
             double du = R(u, i) - mu;
             double dv = R(v, i) - mv;
             num   += du * dv;
@@ -119,12 +148,16 @@ static float pearson_similarity(int u, int v)
         }
     }
 
+    /* A single common item is too weak for a reliable correlation. */
     if (co < 2) return 0.0f;
 
     double denom = sqrt(den_u) * sqrt(den_v);
+    /* If either user has no variation around their mean, correlation is
+     * undefined; treat that pair as unrelated. */
     if (denom < 1e-10) return 0.0f;
 
     float s = (float)(num / denom);
+    /* Clamp tiny floating-point overshoots back into Pearson's valid range. */
     if (s >  1.0f) s =  1.0f;
     if (s < -1.0f) s = -1.0f;
     return s;
@@ -132,6 +165,8 @@ static float pearson_similarity(int u, int v)
 
 static void compute_all_similarities(void)
 {
+    /* The matrix is symmetric: similarity(u,v) == similarity(v,u), so compute
+     * only the upper triangle and mirror it into the lower triangle. */
     for (int u = 0; u < N_USERS; u++)
         SIM(u, u) = 1.0f;
 
@@ -150,6 +185,7 @@ static int cmp_sim_desc(const void *a, const void *b)
 {
     float fa = ((const SimPair *)a)->val;
     float fb = ((const SimPair *)b)->val;
+    /* Sort from highest similarity to lowest similarity for Top-K selection. */
     return (fb > fa) - (fb < fa);
 }
 
@@ -160,12 +196,16 @@ static void compute_all_predictions(void)
     for (int u = 0; u < N_USERS; u++) {
         for (int item = 0; item < N_ITEMS; item++) {
 
+            /* Known training ratings are copied directly; only missing entries
+             * need collaborative-filtering estimates. */
             if (R(u, item) != 0.0f) { PRED(u, item) = R(u, item); continue; }
 
             int cnt = 0;
             for (int v = 0; v < N_USERS; v++) {
                 if (v == u) continue;
                 if (R(v, item) == 0.0f) continue;
+                /* This version uses only positive neighbors.  Negative
+                 * correlations are ignored instead of being used inversely. */
                 float s = SIM(u, v);
                 if (s <= 0.0f) continue;
                 nbrs[cnt].idx = v;
@@ -178,6 +218,11 @@ static void compute_all_predictions(void)
             qsort(nbrs, cnt, sizeof(SimPair), cmp_sim_desc);
             int k = (cnt < TOP_K) ? cnt : TOP_K;
 
+            /* Standard mean-centered prediction:
+             *   pred(u,i) = mean(u) + weighted average of
+             *               neighbor_rating(v,i) - mean(v)
+             * Similar neighbors therefore contribute their preference above or
+             * below their normal rating behavior, not just their raw score. */
             double num = 0.0, den = 0.0;
             for (int j = 0; j < k; j++) {
                 float s = nbrs[j].val;
@@ -189,6 +234,7 @@ static void compute_all_predictions(void)
                          ? user_mean[u] + (float)(num / den)
                          : user_mean[u];
 
+            /* Keep predictions within the synthetic rating scale. */
             if (pred < 1.0f) pred = 1.0f;
             if (pred > 5.0f) pred = 5.0f;
             PRED(u, item) = pred;
@@ -209,6 +255,8 @@ static float evaluate_mae(void)
 
 static void dump_test_predictions_json(const char *path)
 {
+    /* Optional output used by benchmark/equivalence scripts.  Set
+     * PRED_DUMP_PATH to write predictions for the held-out test entries. */
     if (!path) return;
     FILE *fp = fopen(path, "w");
     if (!fp) {
@@ -240,6 +288,8 @@ static float evaluate_rmse(void)
 
 static double similarity_checksum(void)
 {
+    /* Simple reproducibility check: parallel implementations can compare this
+     * value with the serial result to catch major similarity-matrix mistakes. */
     double s = 0.0;
     for (int u = 0; u < N_USERS; u++)
         for (int v = 0; v < N_USERS; v++)
@@ -249,6 +299,9 @@ static double similarity_checksum(void)
 
 int main(int argc, char *argv[])
 {
+    /* Optional command-line arguments let benchmarks scale the problem size:
+     *   ./serial_recommender [num_users] [num_items]
+     */
     N_USERS = (argc >= 2) ? atoi(argv[1]) : DEFAULT_USERS;
     N_ITEMS = (argc >= 3) ? atoi(argv[2]) : DEFAULT_ITEMS;
 
