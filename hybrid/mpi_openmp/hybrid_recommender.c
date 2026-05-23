@@ -275,6 +275,49 @@ static double similarity_checksum(void)
     return s;
 }
 
+static void dump_test_predictions_json_mpi(int start_u, int end_u)
+{
+    const char *path = getenv("PRED_DUMP_PATH");
+    if (!path) return;
+
+    int *pred_recvcounts = (int *)malloc(mpi_size * sizeof(int));
+    int *pred_displs     = (int *)malloc(mpi_size * sizeof(int));
+    for (int r = 0; r < mpi_size; r++) {
+        int s, e;
+        get_range(r, mpi_size, &s, &e);
+        pred_recvcounts[r] = (e - s) * N_ITEMS;
+        pred_displs[r]     = s * N_ITEMS;
+    }
+    MPI_Allgatherv(
+        &predictions[(size_t)start_u * N_ITEMS],
+        (end_u - start_u) * N_ITEMS,
+        MPI_FLOAT,
+        predictions,
+        pred_recvcounts, pred_displs, MPI_FLOAT,
+        MPI_COMM_WORLD
+    );
+    free(pred_recvcounts);
+    free(pred_displs);
+
+    if (mpi_rank != 0) return;
+
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "[JSON]   Could not open %s for writing\n", path);
+        return;
+    }
+    fputc('[', fp);
+    for (int t = 0; t < test_size; t++) {
+        if (t > 0) fputc(',', fp);
+        fprintf(fp, "%.17g",
+                (double)PRED(test_set[t].user, test_set[t].item));
+    }
+    fputs("]\n", fp);
+    fclose(fp);
+    printf("[JSON]   Test predictions written to %s (%d values)\n",
+           path, test_size);
+}
+
 int main(int argc, char *argv[])
 {
     int provided;
@@ -364,6 +407,8 @@ int main(int argc, char *argv[])
     if (mpi_rank == 0)
         printf("[Timing] Prediction phase   : %.4f s"
                "  [MPI %d × OMP %d]\n", t_pred, mpi_size, omp_threads);
+
+    dump_test_predictions_json_mpi(start_u, end_u);
 
     float mae  = evaluate_mae(start_u, end_u);
     float rmse = evaluate_rmse(start_u, end_u);

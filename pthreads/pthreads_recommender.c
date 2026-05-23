@@ -261,6 +261,26 @@ static double similarity_checksum(void)
     return s;
 }
 
+static void dump_test_predictions_json(const char *path)
+{
+    if (!path) return;
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "[JSON]   Could not open %s for writing\n", path);
+        return;
+    }
+    fputc('[', fp);
+    for (int t = 0; t < test_size; t++) {
+        if (t > 0) fputc(',', fp);
+        fprintf(fp, "%.17g",
+                (double)PRED(test_set[t].user, test_set[t].item));
+    }
+    fputs("]\n", fp);
+    fclose(fp);
+    printf("[JSON]   Test predictions written to %s (%d values)\n",
+           path, test_size);
+}
+
 static double run_parallel(void *(*fn)(void *),
                             pthread_t  *threads,
                             ThreadArgs *args)
@@ -328,6 +348,8 @@ int main(int argc, char *argv[])
     t_pred = run_parallel(thread_predictions, threads, args);
     printf("[Timing] Prediction phase   : %.4f s  [pthreads, %d threads]\n",
            t_pred, N_THREADS);
+
+    dump_test_predictions_json(getenv("PRED_DUMP_PATH"));
 
     printf("[Eval]   MAE on test set    : %.4f  (test size: %d)\n",
            evaluate_mae(), test_size);

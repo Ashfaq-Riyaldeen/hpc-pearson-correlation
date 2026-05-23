@@ -24,8 +24,29 @@ RES="$ROOT/results"
 RAW="$RES/timing_raw.txt"
 CSV="$RES/speedup_table.csv"
 MAE="$RES/mae_comparison.txt"
+PRED_DIR="$RES/predictions"                # JSON prediction dumps for Corrected MAE/RMSE
 
 SIZE="1000 1000"   # benchmark problem size (N_USERS N_ITEMS)
+
+# Each binary writes its test-set prediction array to PRED_DUMP_PATH when set.
+# We clean the directory now so a fresh run produces exactly one JSON per config.
+mkdir -p "$PRED_DIR"
+rm -f "$PRED_DIR"/*.json
+
+# Map a (label, workers) pair to the JSON filename Corrected MAE uses.
+pred_path() {
+    local label="$1"; local workers="$2"
+    case "$label" in
+        Serial)      echo "$PRED_DIR/serial.json" ;;
+        OpenMP)      echo "$PRED_DIR/openmp_${workers}T.json" ;;
+        Pthreads)    echo "$PRED_DIR/pthreads_${workers}T.json" ;;
+        MPI)         echo "$PRED_DIR/mpi_${workers}P.json" ;;
+        CUDA)        echo "$PRED_DIR/cuda.json" ;;
+        Hybrid_*)    echo "$PRED_DIR/hybrid_omp_${label#Hybrid_}.json" ;;
+        HybridPT_*)  echo "$PRED_DIR/hybrid_pt_${label#HybridPT_}.json" ;;
+        *)           echo "$PRED_DIR/${label}_${workers}.json" ;;
+    esac
+}
 
 # ── Helper: extract a timing value from one run's output ──────────────────
 # Usage:  get_time "label" "$output_string"
@@ -99,6 +120,12 @@ run_and_record() {
     echo ""
     echo "=== $label ($workers workers) ===" >> "$RAW"
 
+    # Tell the binary to dump its test-set prediction array to a JSON
+    # file. MPI/hybrid commands additionally pass -x PRED_DUMP_PATH on
+    # mpirun so the variable reaches every rank.
+    export PRED_DUMP_PATH
+    PRED_DUMP_PATH="$(pred_path "$label" "$workers")"
+
     # Run the command; capture output AND show it on screen
     local out
     out=$(eval "$cmd" 2>&1)
@@ -170,7 +197,7 @@ done
 # ── 4. MPI ────────────────────────────────────────────────────────────────
 for P in 1 2 4 8; do
     run_and_record "MPI" "$P" \
-        "mpirun -np $P \"$ROOT/mpi_rec\" $SIZE"
+        "mpirun -np $P -x PRED_DUMP_PATH \"$ROOT/mpi_rec\" $SIZE"
 done
 
 # ── 5. CUDA (only if the toolkit was found at compile time) ───────────────
@@ -188,7 +215,7 @@ for CONFIG in "2 4" "4 2" "8 1" "1 8"; do
     T=$(echo $CONFIG | awk '{print $2}')
     WORKERS=$((P * T))
     run_and_record "Hybrid_${P}x${T}" "$WORKERS" \
-        "mpirun -np $P env OMP_NUM_THREADS=$T \"$ROOT/hybrid_omp_rec\" $SIZE"
+        "mpirun -np $P -x PRED_DUMP_PATH env OMP_NUM_THREADS=$T \"$ROOT/hybrid_omp_rec\" $SIZE"
 done
 
 # ── 7. Hybrid MPI+Pthreads ────────────────────────────────────────────────
@@ -199,13 +226,17 @@ for CONFIG in "2 4" "4 2" "8 1" "1 8"; do
     T=$(echo $CONFIG | awk '{print $2}')
     WORKERS=$((P * T))
     run_and_record "HybridPT_${P}x${T}" "$WORKERS" \
-        "mpirun -np $P \"$ROOT/hybrid_pt_rec\" $SIZE $T"
+        "mpirun -np $P -x PRED_DUMP_PATH \"$ROOT/hybrid_pt_rec\" $SIZE $T"
 done
 
 # ── 8. Scalability sweep across problem sizes (Analysis Report §4.7) ───────
 # Strong-scaling above varied the worker count at a fixed 1000x1000 problem.
 # Here we vary the PROBLEM SIZE at fixed best configs (Serial, OpenMP 8T,
 # MPI 8P, CUDA) to show how each model sustains its speedup as N grows.
+# The strong-scaling JSON dumps from §1–§7 are the authoritative set for
+# Corrected MAE/RMSE; turn dumping off here so the scaling re-runs don't
+# overwrite serial.json / openmp_8T.json / mpi_8P.json / cuda.json.
+unset PRED_DUMP_PATH
 SCALE_CSV="$RES/scaling_summary.csv"
 echo "=== Scalability sweep across problem sizes ==="
 cat > "$SCALE_CSV" <<'EOF'
@@ -240,6 +271,20 @@ for SZ in "500 500" "1000 1000" "2000 2000"; do
 done
 echo ""
 
+# ── 9. Corrected MAE/RMSE: parallel predictions vs. serial ────────────────
+# Compares each parallel JSON dump against serial.json prediction-by-prediction
+# (the Corrected_MAE.md "implementation correctness" metric).
+# Expected: every parallel run yields Corrected MAE = Corrected RMSE = 0.0000.
+CORR_CSV="$RES/corrected_mae.csv"
+echo "=== Corrected MAE/RMSE (parallel predictions vs. serial) ==="
+echo "=== Corrected MAE/RMSE (parallel predictions vs. serial) ===" >> "$RAW"
+if command -v python3 >/dev/null 2>&1; then
+    python3 "$RES/compute_corrected_mae.py" "$PRED_DIR" 2>&1 | tee -a "$RAW"
+else
+    echo "  (python3 not found — skipping Corrected MAE step)" | tee -a "$RAW"
+fi
+echo ""
+
 # ── Done ──────────────────────────────────────────────────────────────────
 echo "=========================================="
 echo "Results written to:"
@@ -247,4 +292,6 @@ echo "  $RAW         (full raw output)"
 echo "  $CSV         (speedup table, 1000x1000 worker sweep)"
 echo "  $MAE         (MAE correctness)"
 echo "  $SCALE_CSV   (problem-size scalability sweep)"
+echo "  $PRED_DIR    (per-run JSON prediction dumps)"
+echo "  $CORR_CSV    (Corrected MAE/RMSE: parallel vs. serial predictions)"
 echo "=========================================="

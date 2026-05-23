@@ -237,6 +237,26 @@ static float evaluate_rmse(void)
     return (float)sqrt(sq / test_size);
 }
 
+static void dump_test_predictions_json(const char *path)
+{
+    if (!path) return;
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "[JSON]   Could not open %s for writing\n", path);
+        return;
+    }
+    fputc('[', fp);
+    for (int t = 0; t < test_size; t++) {
+        int u = test_set[t].user, i = test_set[t].item;
+        if (t > 0) fputc(',', fp);
+        fprintf(fp, "%.17g", (double)h_predictions[u * N_ITEMS + i]);
+    }
+    fputs("]\n", fp);
+    fclose(fp);
+    printf("[JSON]   Test predictions written to %s (%d values)\n",
+           path, test_size);
+}
+
 static double similarity_checksum(void)
 {
     double s = 0.0;
@@ -353,6 +373,8 @@ int main(int argc, char *argv[])
                               (size_t)N_USERS * N_ITEMS * sizeof(float),
                               cudaMemcpyDeviceToHost));
     }
+
+    dump_test_predictions_json(getenv("PRED_DUMP_PATH"));
 
     printf("[Eval]   MAE on test set    : %.4f  (test size: %d)\n",
            evaluate_mae(), test_size);
