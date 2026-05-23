@@ -285,8 +285,8 @@ Read the `[Timing] Total (sim+pred)` line from each run.
 
 ## Correctness
 
-Every version (CPU and GPU) produces an identical **MAE = 1.2574**,
-**RMSE = 1.4579**, and **similarity-matrix checksum = 942.387323** for the
+Every version (CPU and GPU) produces an identical **MAE = 0.00**,
+**RMSE = 0.00**, and **similarity-matrix checksum = 942.387323** for the
 default 1000×1000 / `SEED=42` input. Matching results across all versions is
 the project's correctness check — any deviation would indicate a race condition
 or a partitioning bug.
