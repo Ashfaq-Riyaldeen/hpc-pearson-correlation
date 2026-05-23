@@ -1,5 +1,5 @@
-%%  EC7207 / EE7218 — High Performance Computing — Analysis Report
-%%  Topic: Parallel Pearson-correlation collaborative-filtering recommender
+%%  EC7207 / EE7218 High Performance Computing Analysis Report
+%%  Topic: Parallel Pearson correlation collaborative filtering recommender
 %%  Build: pdflatex analysis_report.tex  (run twice for refs)
 
 \documentclass[11pt,a4paper]{article}
@@ -17,6 +17,14 @@
 \usepackage{caption}
 \usepackage{xcolor}
 \usepackage{float}
+\usepackage[section]{placeins}
+% Top-align floats that end up on a dedicated float page (instead of
+% LaTeX's default vertical centering). This stops Figure 5 (CUDA) and
+% any other large figure from appearing in the middle of the next page.
+\makeatletter
+\setlength{\@fptop}{0pt}
+\setlength{\@fpbot}{0pt plus 1fil}
+\makeatother
 \usepackage{enumitem}
 \usepackage{fancyhdr}
 \usepackage{titlesec}
@@ -39,6 +47,8 @@
   singlelinecheck=false,skip=6pt}
 \setlist{itemsep=2pt,topsep=4pt,leftmargin=1.5em}
 \renewcommand{\arraystretch}{1.12}
+\hyphenpenalty=10000
+\exhyphenpenalty=10000
 \titleformat{\section}{\Large\bfseries}{\thesection}{0.8em}{}
 \titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.8em}{}
 \titlespacing*{\section}{0pt}{1.4em}{0.65em}
@@ -80,7 +90,7 @@
     {\LARGE\bfseries Parallel Pearson Correlation\\[0.3em]
       Based Recommendation System\par}
     \vspace{0.45cm}
-    {\large Serial $\cdot$ OpenMP $\cdot$ POSIX Threads $\cdot$ MPI $\cdot$ Hybrid MPI+OpenMP $\cdot$ CUDA\par}
+    {\large Serial $\cdot$ OpenMP $\cdot$ POSIX Threads $\cdot$ MPI $\cdot$ Hybrid MPI+OpenMP $\cdot$ Hybrid MPI+Pthreads $\cdot$ CUDA\par}
     \noindent\rule{0.85\linewidth}{1.2pt}\\[2cm]
 
     {\large \textbf{Group 11}}\\[0.6cm]
@@ -102,30 +112,43 @@
 \section{Introduction and Motivation}\label{sec:intro}
 % ══════════════════════════════════════════════════════════════════════════════
 
-Pearson correlation measures how linearly related two users' rating patterns are,
-making it the natural similarity metric for user-based collaborative filtering.
-To predict how a target user would rate an unseen item, the system finds the
-most similar neighbours, weights their ratings by similarity, and blends them
-into a prediction. The computational cost is dominated by computing all
-pairwise Pearson similarities: for $N = M = 1{,}000$ users and items the upper
-triangle alone requires $499{,}500$ coefficient evaluations --- roughly
-$500$ million floating-point operations --- making the similarity phase the
-single bottleneck of the whole pipeline and the primary target for parallelisation.
+Modern recommendation systems generate personalised suggestions by comparing a
+target user's preferences with the preferences of many other users. This project
+focuses on that problem: as the number of users and items grows, the similarity
+calculation becomes too slow for a simple serial program. Pearson correlation is
+used because it measures how closely two users' rating patterns move together.
+After the system finds similar users, it predicts an unseen rating by combining
+the neighbours' ratings with weights based on their similarity.
 
-This report documents a \textbf{Pearson correlation--based recommender}
-implemented six times --- serial, OpenMP, POSIX threads, MPI, CUDA, and hybrid
-MPI+OpenMP --- all running the same algorithm on the same synthetic data
-($1{,}000$ users $\times\ 1{,}000$ items, \code{SEED=42}, 70\% sparse,
-TOP-K $= 20$). The deliverable is the \emph{comparison} itself: how each
-parallel model is applied, whether accuracy is preserved, and how runtime
-scales from 1 to 8 workers. Every parallel version reproduces the serial result
-exactly (MAE $=1.2574$, RMSE $=1.4579$, similarity checksum $=942.387323$),
-confirming race-free partitioning. CUDA is fastest at $38\times$ over serial;
-OpenMP leads the CPU versions at $6.32\times$ on eight threads.
+The main cost appears during user similarity computation. For the benchmark data
+used in this report, there are $1{,}000$ users and $1{,}000$ items. Each user
+must be compared with all other users, and each comparison may scan many item
+ratings to compute one Pearson similarity value. That creates hundreds of
+thousands of user pair comparisons and roughly hundreds of millions of rating
+checks before prediction begins. This is the exact situation described in the
+proposal: large similarity computations are useful for recommendation systems,
+but they become slow as the data size increases. Therefore the Pearson
+similarity phase is the main bottleneck and the main target for parallelisation.
+
+This report documents a \textbf{Pearson correlation based recommender}
+implemented in seven versions: serial, OpenMP, POSIX threads, MPI, CUDA, hybrid
+MPI+OpenMP, and hybrid MPI+Pthreads. All versions use the same synthetic
+ratings matrix ($1{,}000$ users $\times\ 1{,}000$ items, \code{SEED=42}, 70\%
+sparse, TOP K $= 20$), so the report compares only the effect of the
+parallel programming model. The evaluation checks two questions: whether each
+parallel version preserves the serial result, and how much runtime improves
+as workers increase from 1 to 8. Every parallel version reproduces the serial
+result exactly. For this implementation-correctness evaluation, MAE and RMSE
+are measured as the average error of each implementation's prediction array
+against the serial prediction array. Therefore the serial baseline and every
+parallel version report MAE $=0.0000$ and RMSE $=0.0000$; the similarity-matrix
+checksum is bit-identical at
+$942.387323$, confirming race free partitioning. CUDA is fastest at $38.78\times$ over serial; OpenMP
+leads the CPU versions at $6.26\times$ on eight threads.
 
 \vspace{0.6em}
 \noindent\textbf{Platform.} Pop!\_OS 24.04 LTS $\cdot$ GCC 13.3.0 $\cdot$ Open MPI
-4.1.6 $\cdot$ CUDA 12.0 $\cdot$ Intel Core i7-11800H (8 physical / 16 logical
+4.1.6 $\cdot$ Intel Core i7 11800H (8 physical / 16 logical
 cores) $\cdot$ NVIDIA GeForce RTX 3050 Laptop GPU.
 
 % ══════════════════════════════════════════════════════════════════════════════
@@ -135,22 +158,23 @@ cores) $\cdot$ NVIDIA GeForce RTX 3050 Laptop GPU.
 \subsection{Algorithm Pipeline (Five Phases)}
 
 Every version executes the same five sequential phases summarised in
-Table~\ref{tab:phases}. Only Phases~3 and~4 are parallelised; data generation
-stays serial in all versions because C's \code{rand()} is not thread-safe, and
-running the same \code{srand(42)} sequence everywhere guarantees a byte-identical
-input matrix without any communication.
+Table~\ref{tab:phases}. Phases~3 and~4 dominate runtime and are the main
+parallelisation targets; Phase~2 is also row parallel in the parallel versions.
+Data generation stays serial in all versions because C's \code{rand()} is not
+thread safe, and running the same \code{srand(42)} sequence everywhere
+guarantees a byte identical input matrix without any communication.
 
-\begin{table}[H]
+\begin{table}[!htbp]
 \centering
 \begin{tabular}{C{1.2cm} L{3cm} L{6.5cm} L{3.5cm}}
 \toprule
 \textbf{Phase} & \textbf{Name} & \textbf{Description} & \textbf{Complexity} \\
 \midrule
 1 & Data Generation  & Synthetic sparse matrix; 10\% test split & $O(N \times M)$ \\
-2 & User Means       & Per-user mean $\mu_u$                   & $O(N \times M)$ \\
-3 & Similarity       & Pearson for all $(u,v)$ pairs --- bottleneck & $O(N^2 \times M)$ \\
-4 & Predictions      & TOP-K weighted prediction               & $O(N^2 \times M)$ \\
-5 & MAE Evaluation   & Error on held-out test set              & $O(|T|)$ \\
+2 & User Means       & Mean for each user $\mu_u$              & $O(N \times M)$ \\
+3 & Similarity       & Pearson for all $(u,v)$ pairs, the bottleneck & $O(N^2 \times M)$ \\
+4 & Predictions      & TOP K weighted prediction               & $O(N^2 \times M)$ \\
+5 & Correctness Evaluation & MAE/RMSE against serial predictions & $O(|T|)$ \\
 \bottomrule
 \end{tabular}
 \caption{Algorithm phases and computational complexity.}
@@ -162,7 +186,7 @@ The two heavy phases use the following formulas. Pearson similarity (Phase~3):
   \text{sim}(u,v) = \frac{\sum_i (R_{ui}-\mu_u)(R_{vi}-\mu_v)}
     {\sqrt{\sum_i (R_{ui}-\mu_u)^2}\;\sqrt{\sum_i (R_{vi}-\mu_v)^2}}
 \]
-and the TOP-K weighted prediction (Phase~4):
+and the TOP K weighted prediction (Phase~4):
 \[
   \hat{r}_{ui} = \mu_u + \frac{\sum_{k \in N_K(u)} \text{sim}(u,k)\,(R_{ki}-\mu_k)}
                               {\sum_{k \in N_K(u)} \text{sim}(u,k)}.
@@ -170,193 +194,161 @@ and the TOP-K weighted prediction (Phase~4):
 Both are \emph{embarrassingly parallel at the row level}: the work for one user
 row is independent of every other, which is what makes the same algorithm map
 cleanly onto all five parallel models. Figure~\ref{fig:pipeline} shows the
-pipeline and marks which phases each technology parallelises; the row-wise
-decomposition that keeps every version race-free is then detailed in the
-per-technology diagrams that follow.
+pipeline and marks which phases each technology parallelises; the row wise
+decomposition that keeps every version race free is then detailed in the
+per technology diagrams that follow.
 
-\begin{figure}[H]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=\linewidth]{../analysis_diagrams/drawio/png/diagram_01_algorithm_pipeline.png}
-  \caption{The five-phase recommender pipeline, shared by every implementation.
-  The same algorithm and data (\code{SEED=42}) are used throughout --- only the
+  \caption{The five phase recommender pipeline, shared by every implementation.
+  The same algorithm and data (\code{SEED=42}) are used throughout; only the
   runtime changes. Phase~3 (Pearson similarity) is the $O(N^2 M)$ bottleneck;
-  Phases~3--4 are the targets of all five parallel models, while data generation
-  stays serial.}
+  Phases~3--4 are the main targets of all five parallel models, Phase~2 is also
+  row parallel in the parallel implementations, and data generation stays
+  serial.}
   \label{fig:pipeline}
 \end{figure}
 
-\subsection{OpenMP --- Shared-Memory Fork-Join Parallelism}
+\subsection{OpenMP: Shared Memory Fork Join Parallelism}
 
-OpenMP exploits shared-memory parallelism through compiler directives: a master
+OpenMP exploits shared memory parallelism through compiler directives: a master
 thread forks into $T$ workers that share one address space, then rejoins at an
 implicit barrier (Figure~\ref{fig:openmp}). The decisive design choice is in
 Phase~3, where the outer loop carries \code{\#pragma omp parallel for
 schedule(dynamic,4)}. Dynamic scheduling is essential because the triangular
-similarity loop is badly imbalanced --- the first row performs $N{-}1 = 999$
+similarity loop is badly imbalanced; the first row performs $N{-}1 = 999$
 Pearson calls while the last performs only one. Dynamic scheduling lets idle
-threads pull four-row chunks from a shared work queue, so no core sits idle.
+threads pull four row chunks from a shared work queue, so no core sits idle.
 
-The version stays lock-free without any mutex: each thread owns an exclusive set
-of outer-loop rows $u$ and writes \code{SIM(u,v)} only for those rows, so no two
+The version stays lock free without any mutex: each thread owns an exclusive set
+of outer loop rows $u$ and writes \code{SIM(u,v)} only for those rows, so no two
 threads ever touch the same cell. In Phase~5 the \code{reduction(+:err)} clause
 gives each thread a private accumulator that OpenMP sums at the barrier, and the
-same pattern (\code{reduction(+:sq)}) accumulates the squared error for RMSE.
+same pattern (\code{reduction(+:sq)}) accumulates the squared prediction
+difference for RMSE.
 
-\begin{figure}[H]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=\linewidth]{../analysis_diagrams/drawio/png/diagram_02_openmp.png}
   \caption{OpenMP fork/join model. The master thread forks a team of $T$ workers
   over one shared address space (\code{ratings}, \code{sim\_matrix}, \ldots), each
   owning a disjoint slice of user rows, then rejoins at an implicit barrier. The
-  side notes show the three race-free techniques used: \code{schedule(dynamic,4)}
-  for the triangular loop, disjoint-row writes, and a thread-private \code{nbrs[]}
+  side notes show the three race free techniques used: \code{schedule(dynamic,4)}
+  for the triangular loop, disjoint row writes, and a thread private \code{nbrs[]}
   buffer with \code{reduction(+:err)}.}
   \label{fig:openmp}
 \end{figure}
 
-\subsection{Pthreads --- Manual POSIX Thread Management}
+\subsection{Pthreads: Manual POSIX Thread Management}
 
 POSIX threads require the programmer to create threads, assign work, and
 synchronise explicitly (Figure~\ref{fig:pthreads}). A \code{run\_parallel(fn,
 nthreads)} harness is invoked at the start of Phases~2, 3, and~4: it calls
-\code{pthread\_create()} to spawn $T$ threads --- each receiving a
-\code{ThreadArgs} struct with its \code{tid} and the total \code{nthreads} ---
+\code{pthread\_create()} to spawn $T$ threads, each receiving a
+\code{ThreadArgs} struct with its \code{tid} and the total \code{nthreads},
 lets every thread derive its exclusive row range
 $\text{start} = tid \times \lceil N/T\rceil$,
 $\text{end} = \min(\text{start}+\lceil N/T\rceil,\,N)$, and then uses
 \code{pthread\_join()} as a phase barrier.
 
 The key difference from OpenMP is twofold: threads are created and joined three
-separate times (once per phase), paying OS thread-creation overhead three times
-per run, and the static ceiling-division row assignment cannot compensate for the
-triangular-loop imbalance. Both effects explain the slightly lower efficiency
+separate times (once per phase), paying OS thread creation overhead three times
+per run, and the static ceiling division row assignment cannot compensate for the
+triangular loop imbalance. Both effects explain the slightly lower efficiency
 observed against OpenMP in Section~\ref{sec:timing}.
 
-\begin{figure}[H]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=\linewidth]{../analysis_diagrams/drawio/png/diagram_03_pthreads.png}
-  \caption{Manual POSIX-thread management. \code{main()} calls \code{run\_parallel}
+  \caption{Manual POSIX thread management. \code{main()} calls \code{run\_parallel}
   once per parallel phase: \code{pthread\_create} spawns $T$ threads, each deriving
-  its own \code{ceil}-division row range from a \code{ThreadArgs} struct, and
+  its own \code{ceil} division row range from a \code{ThreadArgs} struct, and
   \code{pthread\_join} on all threads acts as the phase barrier. Disjoint rows plus
-  a private \code{nbrs[]} buffer make it lock-free.}
+  a private \code{nbrs[]} buffer make it lock free.}
   \label{fig:pthreads}
 \end{figure}
 
-\subsection{MPI --- Distributed-Memory Parallelism}
+\subsection{MPI: Distributed Memory Parallelism}
 
 Each MPI rank is an independent process with its own private address space
 (Figure~\ref{fig:mpi}). The $N=1{,}000$ users are divided evenly: rank $r$ owns
 rows $[r \cdot N/P,\; (r{+}1)\cdot N/P)$. Because the ranks cannot share memory,
-data has to be exchanged explicitly through collective operations, summarised per
-phase in Table~\ref{tab:mpi}.
-
-\begin{table}[H]
-\centering
-\begin{tabular}{L{2cm} L{7cm} L{4cm}}
-\toprule
-\textbf{Phase} & \textbf{Strategy} & \textbf{Primitive} \\
-\midrule
-Phase 1 & All ranks call \code{srand(42)} --- no communication & --- \\
-Phase 2 & Each rank computes its \code{user\_mean[]} slice      & \code{MPI\_Allgatherv} \\
-Phase 3 & Each rank fills its rows of the sim matrix           & \code{MPI\_Allgatherv} \\
-Phase 4 & Each rank predicts its own users                     & --- \\
-Phase 5 & Local error sums to rank 0                           & \code{MPI\_Reduce(SUM)} \\
-\bottomrule
-\end{tabular}
-\caption{MPI communication strategy per phase.}
-\label{tab:mpi}
-\end{table}
+data has to be exchanged explicitly through collective operations. Concretely:
+Phase~1 needs no communication (all ranks call \code{srand(42)} independently);
+Phase~2 computes a local \code{user\_mean[]} slice and gathers it with
+\code{MPI\_Allgatherv}; Phase~3 fills the rank's rows of the similarity matrix
+and rebuilds the full matrix on every rank, again with \code{MPI\_Allgatherv};
+Phase~4 predicts the rank's own users with no communication; and Phase~5 sums the
+local serial-vs-parallel prediction error to rank~0 via \code{MPI\_Reduce(SUM)}
+for the global MAE/RMSE.
 
 The \code{MPI\_Allgatherv} that rebuilds the $N \times N$ similarity matrix
 transfers $\approx 4$\,MB at $N=1{,}000$. This is the cost that limits
-single-node efficiency, but it is also exactly the mechanism that makes the code
+single node efficiency, but it is also exactly the mechanism that makes the code
 work unchanged across multiple physical nodes, where shared memory is not an
 option.
 
-\begin{figure}[H]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=\linewidth]{../analysis_diagrams/drawio/png/diagram_04_mpi.png}
-  \caption{MPI distributed-memory layout. Each rank is a separate process with a
+  \caption{MPI distributed memory layout. Each rank is a separate process with a
   private copy of the matrices, computing the similarity rows it owns. A single
   \code{MPI\_Allgatherv} then gives every rank the complete $N\times N$ matrix
   (so predictions need no communication), and \code{MPI\_Reduce} sums the partial
-  test-set error to rank~0 for the global MAE/RMSE.}
+  serial-vs-parallel prediction error to rank~0 for the global MAE/RMSE.}
   \label{fig:mpi}
 \end{figure}
 
-\subsection{CUDA --- GPU Massively Parallel Computing}
+\subsection{CUDA: GPU Massively Parallel Computing}
 
 The CUDA version (\code{cuda/cuda\_recommender.cu}) is fully implemented and
 benchmarked on an NVIDIA GeForce RTX 3050 Laptop GPU (Ampere, compute capability
 8.6, 16 SMs); measured results appear in Section~\ref{sec:cuda-results}. It maps
 the embarrassingly parallel structure of the problem onto one GPU thread per
-output element, using the three kernels in Table~\ref{tab:cuda}.
+output element, using three kernels: \code{kernel\_user\_means} (one thread per
+user, launched as \code{<<<(N+255)/256,\,256>>>}), \code{kernel\_similarity}
+(one thread per $(u,v)$ pair on a 2D grid of $16\times16$ thread blocks), and
+\code{kernel\_predictions} (one thread per $(u,i)$ cell on a 2D users\,$\times$\,items grid).
 
-\begin{table}[H]
-\centering
-\begin{tabular}{L{4.5cm} L{5.5cm} L{4cm}}
-\toprule
-\textbf{Kernel} & \textbf{Launch config} & \textbf{Assignment} \\
-\midrule
-\code{kernel\_user\_means}  & \code{<<<(N+255)/256, 256>>>}           & 1 thread = 1 user \\
-\code{kernel\_similarity}   & \code{dim3($\lceil N/16\rceil$, $\lceil N/16\rceil$), dim3(16,16)} & 1 thread = 1 $(u,v)$ pair \\
-\code{kernel\_predictions}  & 2D grid, users $\times$ items            & 1 thread = 1 $(u,i)$ pair \\
-\bottomrule
-\end{tabular}
-\caption{CUDA kernel configuration for $N=1{,}000$.}
-\label{tab:cuda}
-\end{table}
-
-The similarity kernel alone launches $63 \times 63 \times 256 = 1{,}016{,}064$
-threads simultaneously (Figure~\ref{fig:cuda}). Because device code cannot call
-\code{qsort}, each prediction thread keeps its TOP-K neighbours in a small
-fixed-size register buffer instead. Timing uses \code{cudaEventRecord} so that
+The similarity kernel alone launches a grid with
+$63 \times 63 \times 256 = 1{,}016{,}064$ logical threads
+(Figure~\ref{fig:cuda}). Because device code cannot call
+\code{qsort}, each prediction thread keeps its TOP K neighbours in a small
+fixed size register buffer instead. Timing uses \code{cudaEventRecord} so that
 the reported kernel time excludes the \code{cudaMemcpy} transfer overhead.
 
-\begin{figure}[H]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=\linewidth]{../analysis_diagrams/drawio/png/diagram_05_cuda.png}
   \caption{CUDA GPU model. After a Host$\rightarrow$Device copy of the ratings,
-  three kernels run in sequence on a 2D grid of $16\times16$ thread blocks --- one
-  thread per $(u,v)$ pair / $(\text{user},\text{item})$ cell --- before the
+  three kernels run in sequence on a 2D grid of $16\times16$ thread blocks, with
+  one thread per $(u,v)$ pair / $(\text{user},\text{item})$ cell, before the
   predictions are copied back. The left column shows the GPU memory hierarchy
   (registers $\rightarrow$ shared $\rightarrow$ global $\rightarrow$ host).
   Benchmarked on an NVIDIA RTX 3050 (compute capability 8.6).}
   \label{fig:cuda}
 \end{figure}
 
-\subsection{Hybrid MPI+OpenMP --- Two-Level Parallelism}
+\FloatBarrier
+\subsection{Hybrid MPI+OpenMP: Two Level Parallelism}
 
-The hybrid version combines coarse-grain MPI (across nodes) with fine-grain
+The hybrid version combines coarse grain MPI (across nodes) with fine grain
 OpenMP (within a node), as shown in Figure~\ref{fig:hybrid}. With $P$ MPI ranks
 and $T$ OpenMP threads per rank, the total worker count is $P \times T$ while
-only $P$ messages are sent per collective call.
-\code{MPI\_Init\_thread(MPI\_THREAD\_FUNNELED)} guarantees that every MPI call is
-made from the main thread only, after the OpenMP parallel regions have closed.
-Table~\ref{tab:hybridcfg} lists the four layouts tested at a fixed eight total
-workers.
+only $P$ messages are sent per collective call. The
+\code{MPI\_THREAD\_FUNNELED} mode (selected via \code{MPI\_Init\_thread}) guarantees
+that every MPI call is made from the main thread only, after the OpenMP parallel
+regions have closed. Four layouts are tested at a fixed eight total workers:
+$2\times4$ (fewer MPI messages, more shared memory parallelism),
+$4\times2$ (balanced communication vs.\ threading overhead),
+$8\times1$ (equivalent to pure MPI), and
+$1\times8$ (pure OpenMP wrapped with MPI overhead).
 
-\begin{table}[H]
-\centering
-\begin{tabular}{C{2.5cm} C{2cm} C{2cm} L{7cm}}
-\toprule
-\textbf{Config} & \textbf{P} & \textbf{T} & \textbf{Characteristic} \\
-\midrule
-Hybrid 2$\times$4 & 2 & 4 & Fewer MPI messages; more shared-memory parallelism \\
-Hybrid 4$\times$2 & 4 & 2 & Balanced communication vs.\ threading overhead \\
-Hybrid 8$\times$1 & 8 & 1 & Equivalent to pure MPI \\
-Hybrid 1$\times$8 & 1 & 8 & Pure OpenMP wrapped with MPI overhead \\
-\bottomrule
-\end{tabular}
-\caption{Hybrid configurations (all 8 total workers).}
-\label{tab:hybridcfg}
-\end{table}
-
-\begin{figure}[H]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=\linewidth]{../analysis_diagrams/drawio/png/diagram_06_hybrid_mpi_openmp.png}
-  \caption{Hybrid two-level parallelism. Level~1 (MPI) partitions user-rows across
+  \caption{Hybrid two level parallelism. Level~1 (MPI) partitions user rows across
   $P$ ranks on separate nodes; level~2 (OpenMP) spawns $T$ threads over each rank's
   rows in shared memory, for $P\times T$ total workers. \code{MPI\_Allgatherv} /
   \code{MPI\_Reduce} link the ranks, and \code{MPI\_THREAD\_FUNNELED} keeps all MPI
@@ -364,16 +356,57 @@ Hybrid 1$\times$8 & 1 & 8 & Pure OpenMP wrapped with MPI overhead \\
   \label{fig:hybrid}
 \end{figure}
 
+\FloatBarrier
+\subsection{Hybrid MPI+Pthreads: Two Level Parallelism, POSIX Inner Layer}
+
+A second hybrid variant keeps the outer MPI layer unchanged and replaces the
+inner OpenMP layer with raw POSIX threads (Figure~\ref{fig:hybrid_pt}). The
+purpose is comparative: at the same $P \times T$ worker counts, does the
+intra node threading model change observable performance? The outer structure
+is byte identical to Section~2.6, with the same \code{get\_range} row partition,
+same \code{MPI\_THREAD\_FUNNELED} contract, same \code{MPI\_Allgatherv} after
+Phases~2 and~3, and the same \code{MPI\_Reduce} for the global prediction
+error. Only the inner loop differs: a \code{run\_parallel(fn,
+threads, args, start, end)} harness spawns $T$ pthreads per phase, each
+carrying its rank's row window in its \code{ThreadArgs} and deriving its
+sub range via the same \code{work\_range} ceiling division used by the pure
+pthreads version. Threads are created and joined three times per run
+(Phases~2--4), so unlike OpenMP there is no persistent thread pool to reuse,
+and the inner partition is static so the triangular Phase~3 imbalance cannot
+be smoothed at runtime. The same four $P\times T$ layouts are tested as in the
+MPI+OpenMP hybrid ($2\times4$, $4\times2$, $8\times1$, $1\times8$, all eight
+total workers), so the two variants can be compared head to head; at
+$8\times1$ this reduces to pure MPI (one pthread per rank), and at $1\times8$
+to pure pthreads wrapped with MPI overhead.
+
+\begin{figure}[!htbp]
+  \centering
+  \IfFileExists{../analysis_diagrams/drawio/png/diagram_07_mpi_pthreads.png}
+    {\includegraphics[width=\linewidth]{../analysis_diagrams/drawio/png/diagram_07_mpi_pthreads.png}}
+    {\fbox{\parbox{0.9\linewidth}{\centering\itshape\small
+       Figure missing: \texttt{diagram\_07\_mpi\_pthreads.png}.\\
+       Export it with the draw.io CLI:\\
+       \texttt{drawio --export --format png --scale 2 --border 10 \textbackslash}\\
+       \texttt{\ \ --output analysis\_diagrams/drawio/png/diagram\_07\_mpi\_pthreads.png \textbackslash}\\
+       \texttt{\ \ analysis\_diagrams/drawio/diagram\_07\_mpi\_pthreads.drawio}}}}
+  \caption{Hybrid MPI+Pthreads two level parallelism. Level~1 (MPI) is unchanged
+  from Figure~\ref{fig:hybrid}; level~2 replaces the OpenMP thread team with
+  pthreads that are \code{pthread\_create}'d and \code{pthread\_join}'d once per
+  parallel phase. \code{MPI\_THREAD\_FUNNELED} still applies: collectives run on
+  the main thread only, after the join barrier.}
+  \label{fig:hybrid_pt}
+\end{figure}
+
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Experimental Setup}\label{sec:setup}
 % ══════════════════════════════════════════════════════════════════════════════
 
-All versions are benchmarked on a single Linux laptop --- Intel Core i7-11800H
+All versions are benchmarked on a single Linux laptop: Intel Core i7 11800H
 (8 physical / 16 logical cores) with an NVIDIA GeForce RTX 3050 Laptop GPU for
 the CUDA version. The fixed parameters held constant across every run are listed
 in Table~\ref{tab:config}.
 
-\begin{table}[H]
+\begin{table}[!htbp]
 \centering
 \begin{tabular}{l L{8.7cm}}
 \toprule
@@ -382,13 +415,13 @@ in Table~\ref{tab:config}.
 Users ($N$)            & 1\,000 \\
 Items ($M$)            & 1\,000 \\
 Sparsity               & 70\% \\
-Test split             & 10\%  \quad (29\,866 held-out ratings) \\
-TOP-K neighbours       & 20 \\
+Test split             & 10\%  \quad (29\,866 held out ratings) \\
+TOP K neighbours       & 20 \\
 Random seed            & 42 \\
 Benchmark thread/process counts & 1, 2, 4, 8 \\
 Timing method          & \code{clock\_gettime} / \code{omp\_get\_wtime} / \code{MPI\_Wtime} / \code{cudaEvent} (GPU) \\
 Platform               & Pop!\_OS 24.04 LTS, GCC 13.3.0, Open MPI 4.1.6, CUDA 12.0 \\
-CPU / GPU              & Intel Core i7-11800H (8 phys / 16 logical) / NVIDIA RTX 3050 Laptop GPU \\
+CPU / GPU              & Intel Core i7 11800H (8 phys / 16 logical) / NVIDIA RTX 3050 Laptop GPU \\
 \bottomrule
 \end{tabular}
 \caption{Fixed benchmark parameters used across all versions.}
@@ -397,87 +430,93 @@ CPU / GPU              & Intel Core i7-11800H (8 phys / 16 logical) / NVIDIA RTX
 
 \paragraph{Fairness controls.} The comparison is kept fair by construction:
 \begin{itemize}[noitemsep,topsep=2pt]
-  \item The same \code{SEED=42} gives every version a byte-identical ratings
+  \item The same \code{SEED=42} gives every version a byte identical ratings
         matrix and test split, since Phase~1 runs the same serial \code{rand()}
         sequence everywhere.
-  \item The same fixed parameters ($N=M=1{,}000$, 70\% sparsity, TOP-K $=20$)
+  \item The same fixed parameters ($N=M=1{,}000$, 70\% sparsity, TOP K $=20$)
         are compiled into every source file.
-  \item Reported timing covers only the similarity and prediction phases ---
-        the \code{[Timing] Total (sim+pred)} line that each binary prints ---
+  \item Reported timing covers only the similarity and prediction phases:
+        the \code{[Timing] Total (sim+pred)} line that each binary prints,
         excluding data generation and evaluation.
 \end{itemize}
 
 \paragraph{Measurement protocol.} Speedup is computed as
 $S(p) = T_{\text{serial}} / T_{\text{parallel}}(p)$ from the total
-similarity-plus-prediction time. Thread and process counts are swept over
-$\{1,2,4,8\}$; the hybrid version is measured at the four $P\times T$ layouts of
-Table~\ref{tab:hybridcfg}; and CUDA is benchmarked once on the GPU. Correctness is
-verified from the \code{[Eval]} (MAE/RMSE) and \code{[Check]} (similarity
-checksum) lines emitted by every run.
+similarity plus prediction time. Thread and process counts are swept over
+$\{1,2,4,8\}$; both hybrid variants (MPI+OpenMP and MPI+Pthreads) are measured
+at the four $P\times T$ layouts ($2\times4$, $4\times2$, $8\times1$,
+$1\times8$, all at eight total workers); and CUDA is benchmarked once on the GPU. Correctness is
+reported with MAE/RMSE against the serial prediction array and the
+\code{[Check]} similarity checksum emitted by every run.
 
 % ══════════════════════════════════════════════════════════════════════════════
-\section{Accuracy Analysis --- Parallel vs.\ Serial}\label{sec:accuracy}
+\section{Correctness Analysis: Parallel vs.\ Serial}\label{sec:accuracy}
 % ══════════════════════════════════════════════════════════════════════════════
 
-All parallel implementations are validated against the serial baseline using two
-error metrics --- \textbf{Mean Absolute Error (MAE)} and \textbf{Root Mean Square
-Error (RMSE)} --- together with a \textbf{similarity-matrix checksum}:
+For implementation correctness, the expected value is the serial prediction and
+the observed value is the prediction produced by each parallel implementation
+for the same $(u,i)$ pair. This interpretation is used throughout the report:
+
 \[
-  \text{MAE} = \frac{1}{|T|} \sum_{(u,i) \in T} |\hat{r}_{ui} - r_{ui}|,
-  \qquad
-  \text{RMSE} = \sqrt{\frac{1}{|T|} \sum_{(u,i) \in T} (\hat{r}_{ui} - r_{ui})^2}
-  \qquad (|T| = 29{,}866).
+  \text{MAE} = \frac{1}{|T|} \sum_{(u,i) \in T}
+        \bigl|\hat{r}^{\text{par}}_{ui} - \hat{r}^{\text{ser}}_{ui}\bigr|,
+  \quad
+  \text{RMSE} = \sqrt{\frac{1}{|T|} \sum_{(u,i) \in T}
+        \bigl(\hat{r}^{\text{par}}_{ui} - \hat{r}^{\text{ser}}_{ui}\bigr)^2}.
 \]
-Both are reported, as suggested by the project guideline. MAE treats all errors
-equally on the bounded 1--5 rating scale, while RMSE (always $\ge$ MAE)
-disproportionately penalises occasional large errors --- here
-$\text{RMSE}=1.4579 > \text{MAE}=1.2574$ indicates a modest spread of larger
-misses, as expected for a 70\%-sparse synthetic matrix.
+If every implementation reproduces the serial prediction array exactly, both
+metrics are $0.0000$. The serial row is also $0.0000$ because it is
+the baseline compared against itself.
 
-\begin{table}[H]
+\begin{table}[!htbp]
 \centering
-\begin{tabular}{L{2.6cm} C{1.4cm} C{1.5cm} C{1.5cm} C{2.6cm} R{2.6cm}}
+\small
+\begin{tabular}{L{3.1cm} C{1.6cm} C{2.0cm} C{2.0cm} R{2.8cm}}
 \toprule
-\textbf{Version} & \textbf{Workers} & \textbf{MAE} & \textbf{RMSE} &
-\textbf{Matches Serial?} & \textbf{Sim Checksum} \\
+\textbf{Version} & \textbf{Count} & \textbf{MAE} & \textbf{RMSE} &
+\textbf{Checksum} \\
 \midrule
-Serial         & 1   & 1.2574 & 1.4579 & baseline                & 942.387323 \\
-OpenMP         & 1T  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-OpenMP         & 2T  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-OpenMP         & 4T  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-OpenMP         & 8T  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-Pthreads       & 1T  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-Pthreads       & 2T  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-Pthreads       & 4T  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-Pthreads       & 8T  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-MPI            & 1P  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-MPI            & 2P  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-MPI            & 4P  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-MPI            & 8P  & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
-Hybrid 2$\times$4 & 8 & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$ & 942.387323 \\
-Hybrid 4$\times$2 & 8 & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$ & 942.387323 \\
-Hybrid 8$\times$1 & 8 & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$ & 942.387323 \\
-Hybrid 1$\times$8 & 8 & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$ & 942.387323 \\
-CUDA           & GPU & 1.2574 & 1.4579 & YES $(\Delta=0.0000)$   & 942.387323 \\
+Serial         & 1   & 0.0000 & 0.0000 & 942.387323 \\
+OpenMP         & 1T  & 0.0000 & 0.0000 & 942.387323 \\
+OpenMP         & 2T  & 0.0000 & 0.0000 & 942.387323 \\
+OpenMP         & 4T  & 0.0000 & 0.0000 & 942.387323 \\
+OpenMP         & 8T  & 0.0000 & 0.0000 & 942.387323 \\
+Pthreads       & 1T  & 0.0000 & 0.0000 & 942.387323 \\
+Pthreads       & 2T  & 0.0000 & 0.0000 & 942.387323 \\
+Pthreads       & 4T  & 0.0000 & 0.0000 & 942.387323 \\
+Pthreads       & 8T  & 0.0000 & 0.0000 & 942.387323 \\
+MPI            & 1P  & 0.0000 & 0.0000 & 942.387323 \\
+MPI            & 2P  & 0.0000 & 0.0000 & 942.387323 \\
+MPI            & 4P  & 0.0000 & 0.0000 & 942.387323 \\
+MPI            & 8P  & 0.0000 & 0.0000 & 942.387323 \\
+Hybrid 2$\times$4   & 8 & 0.0000 & 0.0000 & 942.387323 \\
+Hybrid 4$\times$2   & 8 & 0.0000 & 0.0000 & 942.387323 \\
+Hybrid 8$\times$1   & 8 & 0.0000 & 0.0000 & 942.387323 \\
+Hybrid 1$\times$8   & 8 & 0.0000 & 0.0000 & 942.387323 \\
+Hybrid PT 2$\times$4 & 8 & 0.0000 & 0.0000 & 942.387323 \\
+Hybrid PT 4$\times$2 & 8 & 0.0000 & 0.0000 & 942.387323 \\
+Hybrid PT 8$\times$1 & 8 & 0.0000 & 0.0000 & 942.387323 \\
+Hybrid PT 1$\times$8 & 8 & 0.0000 & 0.0000 & 942.387323 \\
+CUDA           & GPU & 0.0000 & 0.0000 & 942.387323 \\
 \bottomrule
 \end{tabular}
-\caption{Accuracy correctness. All 18 runs (17 CPU + 1 GPU) produce identical
-MAE, RMSE, and similarity checksum.}
+\caption{Implementation correctness and bit-identical similarity checksum. All
+22 runs (21 CPU + 1 GPU) produce MAE $=0.0000$ and RMSE $=0.0000$ against the
+serial prediction array.}
 \label{tab:acc}
 \end{table}
 
-As Table~\ref{tab:acc} shows, all 18 runs produce MAE $=\textbf{1.2574}$,
-RMSE $=\textbf{1.4579}$, and checksum $=\textbf{942.387323}$, confirming zero race
-conditions and correct partitioning across every implementation. Crucially, the
-CUDA version --- despite using completely different floating-point hardware and a
-register-based TOP-K selection rather than the CPU's \code{qsort} --- reproduces
-the serial result exactly to four decimal places, validating the GPU kernels.
 
-\begin{figure}[H]
-  \centering
-  \includegraphics[width=0.80\textwidth]{../analysis_diagrams/charts/mae_comparison.png}
-  \caption{MAE correctness. All bars lie within the $\pm0.001$ tolerance band.}
-\end{figure}
+As Table~\ref{tab:acc} shows, all 22 runs produce MAE
+$=\textbf{0.0000}$, RMSE $=\textbf{0.0000}$, and checksum
+$=\textbf{942.387323}$, confirming zero race conditions and correct
+partitioning across every implementation. Crucially, the CUDA version, despite
+using completely different floating point hardware and a register based TOP K
+selection rather than the CPU's \code{qsort}, reproduces the serial result
+exactly. The MPI+Pthreads hybrid also matches exactly, confirming that swapping
+the intra node threading model from OpenMP to raw pthreads is purely a
+\emph{runtime} change and does not perturb the algorithm or partitioning.
+
 
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Timing Measurements and Performance Analysis}\label{sec:timing}
@@ -493,111 +532,138 @@ the serial result exactly to four decimal places, validating the GPU kernels.
   S_{\max}(p) = \frac{1}{f + (1-f)/p}
 \]
 
-The \emph{algorithmic} serial fraction is tiny --- only data generation, user
-means, and evaluation run serially ($\approx 0.025$\,s of $8.4$\,s, $f \approx
-0.3\%$), giving an optimistic $S_{\max}(8) = 1/(0.003+0.997/8) \approx
-7.83\times$. The achievable speedup is instead limited by hardware (reduced
-all-core turbo clocks and memory-bandwidth saturation); fitting Amdahl's Law to
-the measured OpenMP-8T speedup gives an \emph{effective} $f \approx 3.8\%$
-($S_{\max} \approx 26\times$) --- see Section~\ref{sec:amdahl}.
+The measured speedups are interpreted with Amdahl's Law as an upper bound model,
+not as a precise fitted decomposition. The benchmark total used below is
+\code{similarity + prediction}, so setup, data generation, and evaluation are
+outside the reported speedup denominator. The gap between the ideal eight worker
+limit and the measured CPU results is therefore mainly explained by practical
+overheads: scheduling, communication, memory bandwidth, and reduced all core
+turbo clocks.
 
 \subsection{Serial Baseline}
 
-\begin{table}[H]
+\begin{table}[!htbp]
 \centering
 \begin{tabular}{lrr}
 \toprule
 \textbf{Phase} & \textbf{Time (s)} & \textbf{\% of Total} \\
 \midrule
-Similarity matrix (Phase 3) & 1.3549 & 16.2\% \\
-Prediction phase (Phase 4)  & 7.0277 & 83.8\% \\
-\textbf{Total (sim + pred)} & \textbf{8.3826} & \textbf{100\%} \\
+Similarity matrix (Phase 3) & 1.3239 & 15.5\% \\
+Prediction phase (Phase 4)  & 7.2152 & 84.5\% \\
+\textbf{Total (sim + pred)} & \textbf{8.5390} & \textbf{100\%} \\
 \bottomrule
 \end{tabular}
-\caption{Serial baseline timing ($N=M=1{,}000$).}
+\caption{Serial baseline timing ($N=M=1{,}000$). Prediction dominates ($\approx 85\%$), so Phase~4 is the larger speedup opportunity.}
 \end{table}
 
-\subsection{OpenMP --- Varying Thread Count}
+\subsection{OpenMP: Varying Thread Count}
 
-\begin{table}[H]
+\begin{table}[!htbp]
 \centering
-\begin{tabular}{C{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm}}
+\begin{tabular}{C{1.8cm} R{1.9cm} R{1.9cm} R{2.0cm} R{1.9cm} R{2.2cm}}
 \toprule
 \textbf{Threads} & \textbf{Sim (s)} & \textbf{Pred (s)} &
 \textbf{Total (s)} & \textbf{Speedup} & \textbf{Efficiency} \\
 \midrule
-1 & 1.6102 & 7.2447 & 8.8549 & 0.95 & 0.95 \\
-2 & 0.8114 & 3.6679 & 4.4792 & 1.87 & 0.94 \\
-4 & 0.4457 & 2.0704 & 2.5161 & 3.33 & 0.83 \\
-\textbf{8} & \textbf{0.2369} & \textbf{1.0903} & \textbf{1.3272} & \textbf{6.32} & \textbf{0.79} \\
+1 & 1.5565 & 7.0694 & 8.6259 & 0.99 & 0.99 \\
+2 & 0.8081 & 3.6979 & 4.5060 & 1.90 & 0.95 \\
+4 & 0.4205 & 1.9787 & 2.3992 & 3.56 & 0.89 \\
+\textbf{8} & \textbf{0.2390} & \textbf{1.1251} & \textbf{1.3642} & \textbf{6.26} & \textbf{0.78} \\
 \bottomrule
 \end{tabular}
-\caption{OpenMP results. Speedup relative to serial baseline (8.3826 s).}
+\caption{OpenMP results. Speedup relative to serial baseline (8.5390 s).}
 \end{table}
 
-\subsection{Pthreads --- Varying Thread Count}
+\subsection{Pthreads: Varying Thread Count}
 
-\begin{table}[H]
+\begin{table}[!htbp]
 \centering
-\begin{tabular}{C{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm}}
+\begin{tabular}{C{1.8cm} R{1.9cm} R{1.9cm} R{2.0cm} R{1.9cm} R{2.2cm}}
 \toprule
 \textbf{Threads} & \textbf{Sim (s)} & \textbf{Pred (s)} &
 \textbf{Total (s)} & \textbf{Speedup} & \textbf{Efficiency} \\
 \midrule
-1 & 1.3333 & 7.3272 & 8.6605 & 0.97 & 0.97 \\
-2 & 0.9816 & 3.7720 & 4.7536 & 1.76 & 0.88 \\
-4 & 0.5999 & 2.0688 & 2.6687 & 3.14 & 0.79 \\
-\textbf{8} & \textbf{0.3519} & \textbf{1.1275} & \textbf{1.4794} & \textbf{5.67} & \textbf{0.71} \\
+1 & 1.3332 & 7.2654 & 8.5986 & 0.99 & 0.99 \\
+2 & 0.9871 & 3.6410 & 4.6281 & 1.85 & 0.92 \\
+4 & 0.5892 & 2.1080 & 2.6972 & 3.17 & 0.79 \\
+\textbf{8} & \textbf{0.3422} & \textbf{1.1446} & \textbf{1.4868} & \textbf{5.74} & \textbf{0.72} \\
 \bottomrule
 \end{tabular}
 \caption{Pthreads results.}
 \end{table}
 
-\subsection{MPI --- Varying Process Count}
+\FloatBarrier
+\subsection{MPI: Varying Process Count}
 
 \begin{table}[H]
 \centering
-\begin{tabular}{C{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm}}
+\begin{tabular}{C{1.8cm} R{1.9cm} R{1.9cm} R{2.0cm} R{1.9cm} R{2.2cm}}
 \toprule
 \textbf{Processes} & \textbf{Sim (s)} & \textbf{Pred (s)} &
 \textbf{Total (s)} & \textbf{Speedup} & \textbf{Efficiency} \\
 \midrule
-1 & 3.1994 & 7.4317 & 10.6311 & 0.79 & 0.79 \\
-2 & 1.6090 & 3.8648 & 5.4739 & 1.53 & 0.77 \\
-4 & 0.9031 & 2.1281 & 3.0311 & 2.77 & 0.69 \\
-\textbf{8} & \textbf{0.4846} & \textbf{1.1550} & \textbf{1.6395} & \textbf{5.11} & \textbf{0.64} \\
+1 & 3.2286 & 7.4695 & 10.6981 & 0.80 & 0.80 \\
+2 & 1.6226 & 3.7774 & 5.4000 & 1.58 & 0.79 \\
+4 & 0.8644 & 2.0129 & 2.8774 & 2.97 & 0.74 \\
+\textbf{8} & \textbf{0.4944} & \textbf{1.1815} & \textbf{1.6759} & \textbf{5.10} & \textbf{0.64} \\
 \bottomrule
 \end{tabular}
-\caption{MPI results. MPI 1P (10.63 s) $>$ serial (8.38 s) due to process startup
-and \code{MPI\_Allgatherv} overhead at $P=1$ --- expected, not a bug.}
+\caption{MPI results. MPI 1P (10.70 s) $>$ serial (8.54 s) due to process startup
+and \code{MPI\_Allgatherv} overhead at $P=1$, which is expected rather than a bug.}
 \end{table}
 
-\subsection{Hybrid MPI+OpenMP --- Fixed 8 Total Workers}
+\FloatBarrier
+\subsection{Hybrid MPI+OpenMP: Fixed 8 Total Workers}
 
 \begin{table}[H]
 \centering
-\begin{tabular}{L{3cm} C{1.5cm} C{1.5cm} R{2cm} R{2cm} R{2cm} R{1.8cm} R{2cm}}
+\begin{tabular}{L{2.6cm} C{0.7cm} C{0.7cm} R{1.4cm} R{1.5cm} R{1.5cm} R{1.0cm} R{1.0cm}}
 \toprule
 \textbf{Config} & \textbf{P} & \textbf{T} &
 \textbf{Sim (s)} & \textbf{Pred (s)} & \textbf{Total (s)} &
 \textbf{S} & \textbf{E} \\
 \midrule
-Hybrid 2$\times$4 & 2 & 4 & 1.2032 & 2.7766 & 3.9798 & 2.11 & 0.26 \\
-Hybrid 4$\times$2 & 4 & 2 & 0.6169 & 1.1631 & 1.7800 & 4.71 & 0.59 \\
-\textbf{Hybrid 8$\times$1} & \textbf{8} & \textbf{1} & \textbf{0.5149} & \textbf{1.1904} & \textbf{1.7053} & \textbf{4.92} & \textbf{0.61} \\
-Hybrid 1$\times$8 & 1 & 8 & 2.4520 & 5.4913 & 7.9433 & 1.06 & 0.13 \\
+Hybrid 2$\times$4 & 2 & 4 & 1.2220 & 2.7739 & 3.9960 & 2.14 & 0.27 \\
+\textbf{Hybrid 4$\times$2} & \textbf{4} & \textbf{2} & \textbf{0.5627} & \textbf{1.2004} & \textbf{1.7631} & \textbf{4.84} & \textbf{0.61} \\
+Hybrid 8$\times$1 & 8 & 1 & 0.5829 & 1.2140 & 1.7970 & 4.75 & 0.59 \\
+Hybrid 1$\times$8 & 1 & 8 & 2.4116 & 5.3890 & 7.8006 & 1.09 & 0.14 \\
 \bottomrule
 \end{tabular}
-\caption{Hybrid results (8 total workers). Best config is Hybrid 8$\times$1 --- essentially pure MPI.}
+\caption{Hybrid MPI+OpenMP results (8 total workers). Best config is Hybrid 4$\times$2 (4 ranks $\times$ 2 OMP threads) by a small margin over 8$\times$1.}
 \end{table}
 
-\subsection{CUDA --- GPU Benchmark}
+\FloatBarrier
+\subsection{Hybrid MPI+Pthreads: Fixed 8 Total Workers}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{L{2.6cm} C{0.7cm} C{0.7cm} R{1.4cm} R{1.5cm} R{1.5cm} R{1.0cm} R{1.0cm}}
+\toprule
+\textbf{Config} & \textbf{P} & \textbf{T} &
+\textbf{Sim (s)} & \textbf{Pred (s)} & \textbf{Total (s)} &
+\textbf{S} & \textbf{E} \\
+\midrule
+Hybrid PT 2$\times$4 & 2 & 4 & 1.1844 & 2.8401 & 4.0245 & 2.12 & 0.27 \\
+Hybrid PT 4$\times$2 & 4 & 2 & 0.5840 & 1.1967 & 1.7807 & 4.80 & 0.60 \\
+\textbf{Hybrid PT 8$\times$1} & \textbf{8} & \textbf{1} & \textbf{0.5048} & \textbf{1.2654} & \textbf{1.7702} & \textbf{4.82} & \textbf{0.60} \\
+Hybrid PT 1$\times$8 & 1 & 8 & 2.4055 & 5.5972 & 8.0027 & 1.07 & 0.13 \\
+\bottomrule
+\end{tabular}
+\caption{Hybrid MPI+Pthreads results (8 total workers). Same shape as the
+MPI+OpenMP hybrid: best config is 8$\times$1 (essentially pure MPI) ahead of
+4$\times$2 by less than 1\%, both at $\approx 0.6$ efficiency; worst is
+1$\times$8, which pays MPI overhead with no distribution benefit.}
+\label{tab:hybridptresults}
+\end{table}
+
+\FloatBarrier
+\subsection{CUDA: GPU Benchmark}
 \label{sec:cuda-results}
 
 The CUDA version was benchmarked on the same machine's
 \textbf{NVIDIA GeForce RTX 3050 Laptop GPU} (Ampere, compute capability 8.6,
 16 SMs, 4\,GB), compiled with \code{nvcc -O2 -arch=sm\_86}. Speedup is reported
-against the serial baseline ($T_{\text{serial}} = 8.3826$\,s).
+against the serial baseline ($T_{\text{serial}} = 8.5390$\,s).
 
 \begin{table}[H]
 \centering
@@ -605,12 +671,12 @@ against the serial baseline ($T_{\text{serial}} = 8.3826$\,s).
 \toprule
 \textbf{Phase / Metric} & \textbf{Time (s)} & \textbf{Notes} \\
 \midrule
-H$\rightarrow$D transfer (ratings) & 0.0009 & PCIe, one-off \\
-Similarity matrix (Phase 3) & 0.0862 & GPU kernel (CUDA events) \\
-Prediction phase (Phase 4)  & 0.1343 & GPU kernel (CUDA events) \\
-\textbf{Total (sim + pred)}  & \textbf{0.2205} & kernel-only \\
+H$\rightarrow$D transfer (ratings) & 0.0009 & PCIe, one time \\
+Similarity matrix (Phase 3) & 0.0863 & GPU kernel (CUDA events) \\
+Prediction phase (Phase 4)  & 0.1339 & GPU kernel (CUDA events) \\
+\textbf{Total (sim + pred)}  & \textbf{0.2202} & kernel only \\
 \midrule
-Speedup vs.\ serial          & \textbf{38.02$\times$} & vs.\ serial 8.3826\,s \\
+Speedup vs.\ serial          & \textbf{38.78$\times$} & vs.\ serial 8.5390\,s \\
 \bottomrule
 \end{tabular}
 \caption{CUDA timing on the RTX 3050 ($N=M=1{,}000$). The similarity kernel
@@ -618,139 +684,219 @@ launches $63\times63\times256 = 1{,}016{,}064$ threads; kernel time is isolated
 from host\,$\leftrightarrow$\,device transfers via \code{cudaEventRecord}.}
 \end{table}
 
-The GPU completes the combined similarity + prediction work in \textbf{0.22\,s}
---- roughly \textbf{38$\times$} faster than the serial baseline and about
-\textbf{6$\times$} faster than the best 8-thread CPU configuration --- because
+The GPU completes the combined similarity + prediction work in \textbf{0.22\,s},
+roughly \textbf{38.78$\times$} faster than the serial baseline and about
+\textbf{6$\times$} faster than the best 8 thread CPU configuration, because
 the embarrassingly parallel $(u,v)$ and $(u,i)$ workloads map directly onto the
 GPU's thousands of cores. Host\,$\leftrightarrow$\,device transfer cost is
-negligible (sub-millisecond) since the ratings matrix stays resident on the
+negligible (below one millisecond) since the ratings matrix stays resident on the
 device across all three kernels.
+
+\FloatBarrier
+\subsection{Scalability Across Problem Sizes}\label{sec:scaling}
+
+To check how each model holds up as the workload grows, the three fastest
+configurations (Serial baseline, OpenMP 8T, MPI 8P, and CUDA) are run again at
+$500\times500$, $1{,}000\times1{,}000$, and $2{,}000\times2{,}000$.
+Table~\ref{tab:scaling} reports the observed times and speedups (from
+\code{results/scaling\_summary.csv}); note that the serial time at
+$N=M=1{,}000$ here ($8.7561$\,s) is a separate run from the one used as the
+strong scaling baseline in §5.2 ($8.5390$\,s); the two differ by
+$\approx$2.5\%, typical run to run noise.
+
+\begin{table}[!htbp]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{C{1.7cm} R{1.6cm} R{1.6cm} C{1.6cm} R{1.6cm} C{1.6cm} R{1.6cm} C{1.6cm}}
+\toprule
+\textbf{Size} & \textbf{Serial (s)} &
+\textbf{OMP 8T (s)} & \textbf{Speedup} &
+\textbf{MPI 8P (s)} & \textbf{Speedup} &
+\textbf{CUDA (s)}   & \textbf{Speedup} \\
+\midrule
+$500\times500$       &  0.9883 &  0.1531 & 6.45$\times$ &  0.2535 & 3.89$\times$ & 0.0303 & 32.61$\times$ \\
+$1000\times1000$     &  8.7561 &  1.3980 & 6.26$\times$ &  1.6814 & 5.20$\times$ & 0.2206 & 39.69$\times$ \\
+$2000\times2000$     & 78.6369 & 12.9864 & 6.05$\times$ & 16.1278 & 4.87$\times$ & 1.4227 & 55.27$\times$ \\
+\bottomrule
+\end{tabular}}
+\caption{Problem size sweep at the fastest worker count per technology.
+Serial grows as expected ($O(N^2 M)$: $0.99 \rightarrow 8.76 \rightarrow
+78.64$\,s tracks the $N^3$ growth factor). OpenMP speedup is stable
+($6.45\rightarrow 6.26 \rightarrow 6.05$); MPI improves from $500\times500$
+(where \code{MPI\_Allgatherv} is not yet amortised) before declining at the
+largest size; \textbf{CUDA speedup grows with $N$ from $32.6\times$ to
+$55.3\times$} as the GPU fills its SMs and amortises launch and PCIe
+overheads.}
+\label{tab:scaling}
+\end{table}
+
+\paragraph{What the trend reveals.} The three models exhibit qualitatively
+different scaling behaviour. \emph{OpenMP} hovers within 6\% of the same
+speedup across the three sizes, reflecting a model that is essentially
+compute bound on this CPU at any size $\geq 500$. \emph{MPI} is communication
+sensitive: at $500\times500$ the $\approx 1$\,MB \code{MPI\_Allgatherv}
+dominates the small compute window (only $3.89\times$); at $1{,}000$ it
+amortises ($5.20\times$); at $2{,}000$ the rebuilt similarity matrix swells to
+$\approx$16\,MB per rank and efficiency falls back ($4.87\times$). \emph{CUDA}
+exhibits the opposite of MPI: the GPU has spare SMs at the smallest size and
+its speedup climbs sharply with problem size, hitting $55.3\times$ at
+$2{,}000\times2{,}000$; the model that already wins at small $N$ widens
+its lead as the data grows.
 
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Performance Discussion}\label{sec:discussion}
 % ══════════════════════════════════════════════════════════════════════════════
 
-\subsection{Head-to-Head Comparison at 8 Workers}
+\subsection{Head to Head Comparison at 8 Workers}
 
-\begin{table}[H]
+\begin{table}[!htbp]
 \centering
-\begin{tabular}{L{4cm} R{2.5cm} R{2.5cm} R{2.5cm} R{2.5cm}}
+\begin{tabular}{L{3.4cm} R{2.2cm} R{2.2cm} R{2.2cm} R{2.0cm}}
 \toprule
 \textbf{Version} & \textbf{Total (s)} & \textbf{Speedup} &
 \textbf{Efficiency} & \textbf{MAE} \\
 \midrule
-Serial (baseline)        & 8.3826 & 1.00 & 1.00 & 1.2574 \\
-\textbf{CUDA (GPU)}      & \textbf{0.2205} & \textbf{38.02} & --- & 1.2574 \\
-OpenMP 8T                & 1.3272 & 6.32 & 0.79 & 1.2574 \\
-Pthreads 8T              & 1.4794 & 5.67 & 0.71 & 1.2574 \\
-MPI 8P                   & 1.6395 & 5.11 & 0.64 & 1.2574 \\
-Hybrid 8$\times$1        & 1.7053 & 4.92 & 0.61 & 1.2574 \\
-Hybrid 4$\times$2        & 1.7800 & 4.71 & 0.59 & 1.2574 \\
-Hybrid 2$\times$4        & 3.9798 & 2.11 & 0.26 & 1.2574 \\
-Hybrid 1$\times$8        & 7.9433 & 1.06 & 0.13 & 1.2574 \\
+Serial (baseline)        & 8.5390 & 1.00 & 1.00 & 0.0000 \\
+\textbf{CUDA (GPU)}      & \textbf{0.2202} & \textbf{38.78} & n/a & 0.0000 \\
+OpenMP 8T                & 1.3642 & 6.26 & 0.78 & 0.0000 \\
+Pthreads 8T              & 1.4868 & 5.74 & 0.72 & 0.0000 \\
+MPI 8P                   & 1.6759 & 5.10 & 0.64 & 0.0000 \\
+Hybrid 4$\times$2        & 1.7631 & 4.84 & 0.61 & 0.0000 \\
+Hybrid PT 8$\times$1     & 1.7702 & 4.82 & 0.60 & 0.0000 \\
+Hybrid PT 4$\times$2     & 1.7807 & 4.80 & 0.60 & 0.0000 \\
+Hybrid 8$\times$1        & 1.7970 & 4.75 & 0.59 & 0.0000 \\
+Hybrid 2$\times$4        & 3.9960 & 2.14 & 0.27 & 0.0000 \\
+Hybrid PT 2$\times$4     & 4.0245 & 2.12 & 0.27 & 0.0000 \\
+Hybrid 1$\times$8        & 7.8006 & 1.09 & 0.14 & 0.0000 \\
+Hybrid PT 1$\times$8     & 8.0027 & 1.07 & 0.13 & 0.0000 \\
 \bottomrule
 \end{tabular}
-\caption{Head-to-head: CUDA (GPU) plus all CPU versions at 8 workers. CUDA is the
-fastest overall; OpenMP 8T is the best CPU configuration. All MAE values are
-identical. (GPU efficiency per-core is not directly comparable, so omitted.)}
+\caption{Head to head: CUDA (GPU) plus all CPU versions at 8 workers. CUDA is the
+fastest overall; OpenMP 8T is the best CPU configuration. The MAE column shows
+implementation correctness against the serial prediction array,
+identical at 0.0000 for every row. (GPU efficiency per core is not directly
+comparable, so omitted.)}
 \end{table}
 
 \subsection{OpenMP vs.\ Pthreads}
 
-OpenMP ($\times$6.32, 79\% efficiency) outperforms Pthreads ($\times$5.67, 71\%)
+OpenMP ($\times$6.26, 78\% efficiency) outperforms Pthreads ($\times$5.74, 72\%)
 for three reasons. First, \emph{dynamic load balancing}:
-\code{schedule(dynamic,4)} adapts to the triangular-loop imbalance, which the
-static ceiling-division in Pthreads cannot. Second, \emph{thread reuse}: OpenMP
+\code{schedule(dynamic,4)} adapts to the triangular loop imbalance, which the
+static ceiling division in Pthreads cannot. Second, \emph{thread reuse}: OpenMP
 reuses one thread team across Phases~2--4, whereas Pthreads creates and joins
 threads three times per run. Third, \emph{runtime optimisations}: GCC's OpenMP
-runtime applies platform-specific scheduling heuristics.
+runtime applies platform specific scheduling heuristics. The two are closest at
+low thread counts (within 1\% at $T=1$) and the gap widens with thread count, as
+expected when the triangular imbalance has more workers to redistribute.
 
 \subsection{MPI Scaling}
 
-MPI efficiency declines from 79\% ($P=1$) to 64\% ($P=8$). The
+MPI efficiency declines from 80\% ($P=1$) to 64\% ($P=8$). The
 \code{MPI\_Allgatherv} that rebuilds the $N \times N$ similarity matrix
-($\approx 4$\,MB) limits single-node performance. At multi-node scale, where
-shared memory is unavailable, MPI is the mandatory model and this efficiency gap
-with OpenMP would be an acceptable cost.
+($\approx 4$\,MB) limits single node performance. These results do not measure
+multi node execution; they show that MPI is useful but carries communication
+cost on the single node platform used here.
 
-\subsection{Hybrid MPI+OpenMP --- Inversion on a Single Node}
+\subsection{Hybrid MPI+OpenMP: Inversion on a Single Node}
 
-On a single node, using \emph{more} MPI processes yields \emph{better} hybrid
-performance:
+On a single node, hybrid performance rises sharply with the MPI rank count and
+then flattens once the rank count matches the number of physical cores:
 \begin{center}
-Hybrid 8$\times$1 ($\times$4.92) $>$ 4$\times$2 ($\times$4.71)
-$>$ 2$\times$4 ($\times$2.11) $>$ 1$\times$8 ($\times$1.06).
+Hybrid 4$\times$2 ($\times$4.84) $\approx$ 8$\times$1 ($\times$4.75)
+$\gg$ 2$\times$4 ($\times$2.14) $>$ 1$\times$8 ($\times$1.09).
 \end{center}
-When fewer MPI ranks are used, the MPI startup and \code{MPI\_Allgatherv} cost
-dominates what is essentially an OpenMP workload. The Hybrid 1$\times$8
-configuration pays all the MPI overhead while gaining zero distribution benefit.
-\textbf{The hybrid model's advantage over pure OpenMP only emerges at multi-node
-scale.}
+The 4$\times$2 and 8$\times$1 configurations are statistically tied at
+$\approx$60\% efficiency. In this run 4$\times$2 edges 8$\times$1 by under
+2\%, having more aggressive OMP scheduling absorb the triangular imbalance
+within each rank's slice. Below that, the picture is unambiguous: when fewer
+MPI ranks are used, the MPI startup and \code{MPI\_Allgatherv} cost dominates
+what is essentially an OpenMP workload. The Hybrid 1$\times$8 configuration
+pays all the MPI overhead while gaining zero distribution benefit.
+\textbf{On this single node setup, the hybrid model does not outperform pure
+OpenMP; its main justification is compatibility with systems where work must be
+split across MPI ranks.}
+
+\subsection{Hybrid MPI+OpenMP vs.\ MPI+Pthreads}
+
+Comparing the two hybrid variants at matched $P\times T$ layouts isolates the
+effect of the intra node threading model: the outer MPI structure, the row
+partition, and the collective calls are identical in both. The MPI+OpenMP
+variant is faster wherever the inner team has more than one thread
+(4$\times$2: 1.7631\,s vs.\ 1.7807\,s; 2$\times$4: 3.9960\,s vs.\ 4.0245\,s;
+1$\times$8: 7.8006\,s vs.\ 8.0027\,s), mirroring what is already seen at the
+single technology level between pure OpenMP (6.26$\times$) and pure Pthreads
+(5.74$\times$). The gap comes from the same two mechanisms: (i)~OpenMP's
+\code{schedule(dynamic,4)} smooths the triangular Phase~3 imbalance that the
+pthreads \code{work\_range} static partition cannot, and (ii)~OpenMP reuses
+one thread team across phases, whereas the pthreads harness pays
+\code{pthread\_create}/\code{pthread\_join} overhead three times per run. At
+$T{=}1$, where the threading model is effectively bypassed and only the MPI
+layer matters, the two hybrids converge. In fact, Hybrid PT 8$\times$1
+(1.7702\,s) edges Hybrid 8$\times$1 (1.7970\,s) by $\approx$1.5\%, well within
+run to run noise, because there is no OpenMP runtime to amortise and the
+pthreads binary skips the OMP team creation cost entirely.
 
 \subsection{Amdahl's Law}\label{sec:amdahl}
 
-With an algorithmic serial fraction of only $f \approx 0.3\%$, the optimistic
-limit is $S_{\max}(8) \approx 7.83\times$. No CPU model reaches it --- the real
-bottleneck is hardware (reduced all-core turbo and memory-bandwidth contention in
-the memory-bound prediction phase), not serial code.
-
-\begin{table}[H]
-\centering
-\begin{tabular}{L{3cm} R{3cm} R{3cm} L{5.5cm}}
-\toprule
-\textbf{Technology} & \textbf{Limit ($f\approx0.3\%$)} & \textbf{Actual} & \textbf{Observation} \\
-\midrule
-OpenMP 8T   & 7.83$\times$ & 6.32$\times$ &
-  Closest to limit; dynamic scheduling balances the triangular load \\
-Pthreads 8T & 7.83$\times$ & 5.67$\times$ &
-  Further below: static row split cannot balance the triangular load \\
-MPI 8P      & 7.83$\times$ & 5.11$\times$ &
-  Below limit: \code{MPI\_Allgatherv} communication overhead \\
-\bottomrule
-\end{tabular}
-\caption{Amdahl's Law limit vs.\ actual measured speedup at $p=8$. Fitting the
-model to OpenMP-8T gives an \emph{effective} $f \approx 3.8\%$ ($S_{\max}\approx
-26\times$), capturing the hardware overhead.}
-\end{table}
+Amdahl's Law explains why the CPU implementations remain below the ideal
+eight worker limit. The similarity and prediction phases are highly parallel,
+but the measured speedups also include scheduling overhead, memory bandwidth
+pressure, MPI collectives, and lower all core turbo frequency. OpenMP therefore
+comes closest to the ideal, Pthreads loses additional efficiency through static
+work splitting and thread creation, and MPI loses more to collective
+communication.
 
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Conclusions}\label{sec:conclusions}
 % ══════════════════════════════════════════════════════════════════════════════
 
 \begin{enumerate}
-  \item \textbf{All versions preserve correctness.} Every implementation (CPU and
-        GPU) produces MAE $=\textbf{1.2574}$ and checksum $=\textbf{942.387323}$,
-        identical to the serial baseline.
-  \item \textbf{OpenMP achieves the best CPU performance.} $\times$6.32 speedup at
-        8 threads, 79\% efficiency. Dynamic scheduling and thread reuse explain
+  \item \textbf{All versions preserve correctness.} MAE and RMSE are computed
+        against the serial prediction array. Every implementation achieves
+        MAE $=\textbf{0.0000}$ and RMSE $=\textbf{0.0000}$, and the
+        similarity-matrix checksum is bit-identical at $\textbf{942.387323}$.
+  \item \textbf{OpenMP achieves the best CPU performance.} $\times$6.26 speedup at
+        8 threads, 78\% efficiency. Dynamic scheduling and thread reuse explain
         the advantage.
-  \item \textbf{Pthreads is competitive but less efficient.} $\times$5.67 at 8T,
-        71\% efficiency. Static row assignment and per-phase thread creation limit
-        scalability.
+  \item \textbf{Pthreads is competitive but less efficient.} $\times$5.74 at 8T,
+        72\% efficiency. Static row assignment and per phase thread creation
+        limit scalability.
   \item \textbf{MPI achieves good speedup with communication overhead.}
-        $\times$5.11 at 8P, 64\% efficiency. MPI would close the gap at multi-node
-        scale.
-  \item \textbf{Hybrid performance inversely correlates with OpenMP thread count
-        on a single node.} Hybrid 8$\times$1 ($\times$4.92) is the best hybrid
-        configuration; Hybrid 1$\times$8 is the worst ($\times$1.06). The hybrid
-        advantage over pure OpenMP only emerges at multi-node scale.
+        $\times$5.10 at 8P, 64\% efficiency. On this single node benchmark,
+        \code{MPI\_Allgatherv} communication keeps it behind OpenMP.
+  \item \textbf{Hybrid performance is best when the inner thread count is small
+        on a single node.} The four MPI+OpenMP configurations rank
+        4$\times$2 ($\times$4.84) $\gtrsim$ 8$\times$1 ($\times$4.75)
+        $\gg$ 2$\times$4 ($\times$2.14) $>$ 1$\times$8 ($\times$1.09); the
+        MPI+Pthreads variant ranks 8$\times$1 ($\times$4.82) $\gtrsim$
+        4$\times$2 ($\times$4.80) $\gg$ 2$\times$4 ($\times$2.12) $>$
+        1$\times$8 ($\times$1.07). The two hybrids agree to within $\approx$2\%
+        at every layout. The OMP variant wins at $T>1$ (dynamic scheduling),
+        while the PT variant wins at $T=1$ (no OMP runtime overhead). On this
+        single node run, both hybrids stay behind pure OpenMP.
   \item \textbf{CUDA provides the largest speedup by far.} Benchmarked on the
         NVIDIA RTX 3050, the GPU completes similarity + prediction in
-        \textbf{0.2205\,s} --- a \textbf{38.0$\times$} speedup over the serial
-        baseline and $\approx$6$\times$ faster than the best 8-thread CPU run.
-        The similarity kernel launches 1{,}016{,}064 threads simultaneously.
+        \textbf{0.2202\,s}, a \textbf{38.78$\times$} speedup over the serial
+        baseline and $\approx$6$\times$ faster than the best 8 thread CPU run.
+        The similarity kernel launches a grid with 1{,}016{,}064 logical
+        threads.
 \end{enumerate}
 
 \textbf{Final ranking (single node):}
 \begin{center}
-CUDA GPU ($\times$38.0)
-$>$ OpenMP 8T ($\times$6.32)
-$>$ Pthreads 8T ($\times$5.67)
-$>$ MPI 8P ($\times$5.11)
-$>$ Hybrid 8$\times$1 ($\times$4.92)
-$>$ Hybrid 4$\times$2 ($\times$4.71)
-$>$ Hybrid 2$\times$4 ($\times$2.11)
-$>$ Hybrid 1$\times$8 ($\times$1.06)
+CUDA GPU ($\times$38.78)
+$>$ OpenMP 8T ($\times$6.26)
+$>$ Pthreads 8T ($\times$5.74)
+$>$ MPI 8P ($\times$5.10) \\[2pt]
+$>$ Hybrid 4$\times$2 ($\times$4.84)
+$>$ Hybrid PT 8$\times$1 ($\times$4.82)
+$>$ Hybrid PT 4$\times$2 ($\times$4.80)
+$>$ Hybrid 8$\times$1 ($\times$4.75) \\[2pt]
+$>$ Hybrid 2$\times$4 ($\times$2.14)
+$>$ Hybrid PT 2$\times$4 ($\times$2.12)
+$>$ Hybrid 1$\times$8 ($\times$1.09)
+$>$ Hybrid PT 1$\times$8 ($\times$1.07)
 \end{center}
 
 % ══════════════════════════════════════════════════════════════════════════════
@@ -758,18 +904,20 @@ $>$ Hybrid 1$\times$8 ($\times$1.06)
 \addcontentsline{toc}{section}{References}
 % ══════════════════════════════════════════════════════════════════════════════
 
+\begingroup\sloppy
 \begin{enumerate}
   \item J.\ S.\ Breese, D.\ Heckerman, and C.\ Kadie,
         ``Empirical analysis of predictive algorithms for collaborative filtering,''
         \textit{arXiv:1301.7363}, 2013.
   \item B.\ Sarwar, G.\ Karypis, J.\ Konstan, and J.\ Riedl,
-        ``Item-based collaborative filtering recommendation algorithms,''
+        ``Item based collaborative filtering recommendation algorithms,''
         in \textit{Proc.\ WWW}, pp.\ 285--295, 2001.
   \item B.\ Chapman, G.\ Jost, R.\ van der Pas, \textit{Using OpenMP}. MIT Press, 2008.
   \item W.\ Gropp, E.\ Lusk, A.\ Skjellum, \textit{Using MPI}. MIT Press, 1994.
   \item J.\ Nickolls et al., ``Scalable parallel programming with CUDA,''
         \textit{Queue}, vol.\ 6, no.\ 2, pp.\ 40--53, 2008.
 \end{enumerate}
+\endgroup
 
 \vfill
 \noindent\rule{\linewidth}{0.5pt}\\[0.3em]
