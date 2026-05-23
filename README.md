@@ -53,6 +53,7 @@ The canonical runner compiles every version, sweeps worker counts (1/2/4/8)
 and problem sizes (500/1000/2000), and writes the results files:
 
 ```bash
+dos2unix results/run_benchmarks.sh
 bash results/run_benchmarks.sh        # run from the project root
 ```
 
