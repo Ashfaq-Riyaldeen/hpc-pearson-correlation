@@ -3,6 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include <mpi.h>
+#include <limits.h> 
 
 #define DEFAULT_USERS  1000
 #define DEFAULT_ITEMS  1000
@@ -61,9 +62,16 @@ static void free_arrays(void)
     free(test_set);
 }
 
+static unsigned int lcg_rand(unsigned int *state)
+{
+    *state = *state * 1664525u + 1013904223u;
+    return *state;
+}
+
 static void generate_data(void)
 {
-    srand(SEED);
+     unsigned int rng1 = SEED;
+    unsigned int rng2 = SEED + 1;
 
     int capacity = (int)((size_t)N_USERS * N_ITEMS * (1.0f - SPARSITY)) + 1000;
     test_set  = (TestEntry *)malloc(capacity * sizeof(TestEntry));
@@ -71,11 +79,11 @@ static void generate_data(void)
 
     for (int u = 0; u < N_USERS; u++) {
         for (int i = 0; i < N_ITEMS; i++) {
-            if ((float)rand() / RAND_MAX < SPARSITY) continue;
+            if ((float)lcg_rand(&rng1) / UINT_MAX < SPARSITY) continue;
 
-            float rating = (float)(rand() % 5) + 1.0f;
+            float rating = (float)(lcg_rand(&rng1) % 5) + 1.0f;
 
-            if ((float)rand() / RAND_MAX < TEST_RATIO && test_size < capacity) {
+            if ((float)lcg_rand(&rng2) / UINT_MAX < TEST_RATIO && test_size < capacity) {
                 test_set[test_size].user   = u;
                 test_set[test_size].item   = i;
                 test_set[test_size].rating = rating;
@@ -86,7 +94,7 @@ static void generate_data(void)
         }
     }
 
-    if (mpi_rank == 0)
+ if (mpi_rank == 0)
         printf("[Data]   Users: %d | Items: %d | Sparsity: %.0f%% | "
                "Test ratings: %d\n",
                N_USERS, N_ITEMS, SPARSITY * 100.0f, test_size);
