@@ -5,6 +5,21 @@
 #include <pthread.h>
 #include <mpi.h>
 
+/*
+ * Hybrid MPI+Pthreads user-based collaborative filtering recommender.
+ *
+ * The recommendation algorithm matches the serial baseline: generate sparse
+ * ratings, hold out a test set, compute Pearson user-user similarities, and
+ * predict missing ratings from the TOP_K most similar positive neighbors.
+ *
+ * Parallel model:
+ *   1. MPI assigns each process a contiguous block of user rows.
+ *   2. Pthreads inside each process split that rank-owned row block.
+ *   3. MPI gathers distributed user means and similarity rows when later phases
+ *      need the complete arrays on every rank.
+ *   4. MPI reductions combine local MAE/RMSE errors into rank 0 results.
+ */
+
 #define DEFAULT_USERS    1000
 #define DEFAULT_ITEMS    1000
 #define DEFAULT_THREADS     4
@@ -29,6 +44,8 @@ typedef struct { int user; int item; float rating; } TestEntry;
 static TestEntry *test_set;
 static int        test_size;
 
+/* Row-major matrix indexing helpers.  In ratings[], zero means "unknown";
+ * generated ratings use the 1..5 scale. */
 #define R(u,i)    ratings[(size_t)(u)*N_ITEMS  + (i)]
 #define SIM(u,v)  sim_matrix[(size_t)(u)*N_USERS + (v)]
 #define PRED(u,i) predictions[(size_t)(u)*N_ITEMS + (i)]
@@ -36,6 +53,8 @@ static int        test_size;
 typedef struct {
     int tid;
     int nthreads;
+    /* User rows owned by this MPI rank.  Each pthread receives a subrange
+     * inside [rank_start, rank_end). */
     int rank_start;
     int rank_end;
 } ThreadArgs;
@@ -45,6 +64,7 @@ static inline double now_sec(void) { return MPI_Wtime(); }
 /* MPI rank-level row partition (matches hybrid/mpi_openmp version). */
 static void get_range(int rank, int size, int *start, int *end)
 {
+    /* MPI-level partition: rank r owns a contiguous block of user rows. */
     int chunk = (N_USERS + size - 1) / size;
     *start = rank * chunk;
     *end   = *start + chunk;
@@ -54,6 +74,7 @@ static void get_range(int rank, int size, int *start, int *end)
 /* Pthread-level partition of [0, total) for tid in [0, nthreads). */
 static void work_range(int total, int tid, int nthreads, int *start, int *end)
 {
+    /* Thread-level partition: split one rank's local rows among pthreads. */
     int chunk = (total + nthreads - 1) / nthreads;
     *start = tid * chunk;
     *end   = *start + chunk;
@@ -82,16 +103,23 @@ static void free_arrays(void)
 
 static void generate_data(void)
 {
+    /* Same seed on every rank means each process independently creates the same
+     * synthetic ratings and test set without broadcasting them. */
     srand(SEED);
 
+    /* Approximate capacity for held-out ratings; the exact count depends on the
+     * random sparsity pattern and TEST_RATIO. */
     int capacity = (int)((size_t)N_USERS * N_ITEMS * (1.0f - SPARSITY)) + 1000;
     test_set  = (TestEntry *)malloc(capacity * sizeof(TestEntry));
     test_size = 0;
 
     for (int u = 0; u < N_USERS; u++) {
         for (int i = 0; i < N_ITEMS; i++) {
+            /* Skip most cells to simulate a sparse recommender dataset. */
             if ((float)rand() / RAND_MAX < SPARSITY) continue;
             float rating = (float)(rand() % 5) + 1.0f;
+            /* Held-out test ratings are hidden from training and used only for
+             * final prediction-error evaluation. */
             if ((float)rand() / RAND_MAX < TEST_RATIO && test_size < capacity) {
                 test_set[test_size].user   = u;
                 test_set[test_size].item   = i;
@@ -115,6 +143,8 @@ static void *thread_user_means(void *arg)
     ThreadArgs *a = (ThreadArgs *)arg;
     int rank_rows = a->rank_end - a->rank_start;
     int rel_start, rel_end;
+    /* Convert this thread's relative slice of the rank block into absolute
+     * user ids. */
     work_range(rank_rows, a->tid, a->nthreads, &rel_start, &rel_end);
     int start = a->rank_start + rel_start;
     int end   = a->rank_start + rel_end;
@@ -125,6 +155,7 @@ static void *thread_user_means(void *arg)
         for (int i = 0; i < N_ITEMS; i++) {
             if (R(u, i) != 0.0f) { sum += R(u, i); cnt++; }
         }
+        /* Neutral fallback for users with no observed training ratings. */
         user_mean[u] = (cnt > 0) ? (float)(sum / cnt) : 3.0f;
     }
     return NULL;
@@ -138,6 +169,8 @@ static float pearson_similarity(int u, int v)
 
     for (int i = 0; i < N_ITEMS; i++) {
         if (R(u, i) != 0.0f && R(v, i) != 0.0f) {
+            /* Pearson correlation uses centered ratings on co-rated items, so
+             * each user's normal rating level is removed. */
             double du = R(u, i) - mu;
             double dv = R(v, i) - mv;
             num   += du * dv;
@@ -147,11 +180,14 @@ static float pearson_similarity(int u, int v)
         }
     }
 
+    /* Correlation is unreliable with fewer than two shared ratings and
+     * undefined when either user has no variance around their mean. */
     if (co < 2) return 0.0f;
     double denom = sqrt(den_u) * sqrt(den_v);
     if (denom < 1e-10) return 0.0f;
 
     float s = (float)(num / denom);
+    /* Clamp small floating-point overshoots back into Pearson's valid range. */
     if (s >  1.0f) s =  1.0f;
     if (s < -1.0f) s = -1.0f;
     return s;
@@ -167,6 +203,8 @@ static void *thread_similarities(void *arg)
     ThreadArgs *a = (ThreadArgs *)arg;
     int rank_rows = a->rank_end - a->rank_start;
     int rel_start, rel_end;
+    /* Each pthread computes complete similarity rows for a subset of this
+     * rank's users. */
     work_range(rank_rows, a->tid, a->nthreads, &rel_start, &rel_end);
     int start = a->rank_start + rel_start;
     int end   = a->rank_start + rel_end;
@@ -187,6 +225,7 @@ static int cmp_sim_desc(const void *a, const void *b)
 {
     float fa = ((const SimPair *)a)->val;
     float fb = ((const SimPair *)b)->val;
+    /* Sort neighbors from strongest similarity to weakest for Top-K selection. */
     return (fb > fa) - (fb < fa);
 }
 
@@ -198,10 +237,14 @@ static void *thread_predictions(void *arg)
     ThreadArgs *a = (ThreadArgs *)arg;
     int rank_rows = a->rank_end - a->rank_start;
     int rel_start, rel_end;
+    /* Prediction rows are independent, so the same row-splitting helper works
+     * for this phase too. */
     work_range(rank_rows, a->tid, a->nthreads, &rel_start, &rel_end);
     int start = a->rank_start + rel_start;
     int end   = a->rank_start + rel_end;
 
+    /* Private per-thread buffer avoids races while collecting and sorting
+     * neighbor candidates. */
     SimPair *nbrs = (SimPair *)malloc(N_USERS * sizeof(SimPair));
     if (!nbrs) {
         fprintf(stderr, "Rank %d thread %d: malloc failed.\n",
@@ -212,6 +255,7 @@ static void *thread_predictions(void *arg)
     for (int u = start; u < end; u++) {
         for (int item = 0; item < N_ITEMS; item++) {
 
+            /* Known training ratings do not need estimation. */
             if (R(u, item) != 0.0f) {
                 PRED(u, item) = R(u, item);
                 continue;
@@ -220,6 +264,7 @@ static void *thread_predictions(void *arg)
             int cnt = 0;
             for (int v = 0; v < N_USERS; v++) {
                 if (v == u || R(v, item) == 0.0f) continue;
+                /* Use only positive neighbors that already rated this item. */
                 float s = SIM(u, v);
                 if (s <= 0.0f) continue;
                 nbrs[cnt].idx = v;
@@ -232,6 +277,10 @@ static void *thread_predictions(void *arg)
             qsort(nbrs, cnt, sizeof(SimPair), cmp_sim_desc);
             int k = (cnt < TOP_K) ? cnt : TOP_K;
 
+            /* Mean-centered Top-K prediction:
+             *   pred(u,i) = mean(u) + weighted average of
+             *               neighbor_rating(v,i) - mean(v)
+             */
             double num = 0.0, den = 0.0;
             for (int j = 0; j < k; j++) {
                 float s = nbrs[j].val;
@@ -242,6 +291,7 @@ static void *thread_predictions(void *arg)
             float pred = (den > 1e-10)
                          ? user_mean[u] + (float)(num / den)
                          : user_mean[u];
+            /* Keep predicted ratings on the 1..5 scale. */
             if (pred < 1.0f) pred = 1.0f;
             if (pred > 5.0f) pred = 5.0f;
             PRED(u, item) = pred;
@@ -260,6 +310,8 @@ static double run_parallel(void *(*fn)(void *),
 {
     double t0 = now_sec();
 
+    /* Create workers for one phase.  After all threads join, the main thread is
+     * free to perform any MPI collective required by that phase. */
     for (int t = 0; t < N_THREADS; t++) {
         args[t].tid        = t;
         args[t].nthreads   = N_THREADS;
@@ -285,6 +337,7 @@ static float evaluate_mae(int start_u, int end_u)
 {
     double local_err = 0.0;
     int    local_cnt = 0;
+    /* Each rank evaluates only the held-out ratings for users it predicted. */
     for (int t = 0; t < test_size; t++) {
         int u = test_set[t].user;
         if (u < start_u || u >= end_u) continue;
@@ -294,6 +347,7 @@ static float evaluate_mae(int start_u, int end_u)
 
     double global_err = 0.0;
     int    global_cnt = 0;
+    /* Rank 0 receives the summed absolute error and total test count. */
     MPI_Reduce(&local_err, &global_err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_cnt, &global_cnt, 1, MPI_INT,    MPI_SUM, 0, MPI_COMM_WORLD);
 
@@ -304,6 +358,8 @@ static float evaluate_mae(int start_u, int end_u)
 
 static float evaluate_rmse(int start_u, int end_u)
 {
+    /* Same distributed evaluation as MAE, but with squared errors and a final
+     * square root on rank 0. */
     double local_sq  = 0.0;
     int    local_cnt = 0;
     for (int t = 0; t < test_size; t++) {
@@ -326,6 +382,8 @@ static float evaluate_rmse(int start_u, int end_u)
 
 static double similarity_checksum(void)
 {
+    /* Simple reproducibility check against the serial and other parallel
+     * versions. */
     double s = 0.0;
     for (int u = 0; u < N_USERS; u++)
         for (int v = 0; v < N_USERS; v++)
@@ -333,9 +391,57 @@ static double similarity_checksum(void)
     return s;
 }
 
+static void dump_test_predictions_json_mpi(int start_u, int end_u)
+{
+    /* Optional benchmark output.  When PRED_DUMP_PATH is set, gather all
+     * distributed prediction rows so rank 0 can write test predictions in the
+     * same order as the serial implementation. */
+    const char *path = getenv("PRED_DUMP_PATH");
+    if (!path) return;
+
+    int *pred_recvcounts = (int *)malloc(mpi_size * sizeof(int));
+    int *pred_displs     = (int *)malloc(mpi_size * sizeof(int));
+    for (int r = 0; r < mpi_size; r++) {
+        int s, e;
+        get_range(r, mpi_size, &s, &e);
+        pred_recvcounts[r] = (e - s) * N_ITEMS;
+        pred_displs[r]     = s * N_ITEMS;
+    }
+    MPI_Allgatherv(
+        &predictions[(size_t)start_u * N_ITEMS],
+        (end_u - start_u) * N_ITEMS,
+        MPI_FLOAT,
+        predictions,
+        pred_recvcounts, pred_displs, MPI_FLOAT,
+        MPI_COMM_WORLD
+    );
+    free(pred_recvcounts);
+    free(pred_displs);
+
+    if (mpi_rank != 0) return;
+
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "[JSON]   Could not open %s for writing\n", path);
+        return;
+    }
+    fputc('[', fp);
+    for (int t = 0; t < test_size; t++) {
+        if (t > 0) fputc(',', fp);
+        fprintf(fp, "%.17g",
+                (double)PRED(test_set[t].user, test_set[t].item));
+    }
+    fputs("]\n", fp);
+    fclose(fp);
+    printf("[JSON]   Test predictions written to %s (%d values)\n",
+           path, test_size);
+}
+
 int main(int argc, char *argv[])
 {
     int provided;
+    /* FUNNELED is sufficient: pthread workers do local CPU work, while only the
+     * main thread calls MPI routines. */
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
@@ -377,6 +483,8 @@ int main(int argc, char *argv[])
     int *sim_recvcounts  = (int *)malloc(mpi_size * sizeof(int));
     int *sim_displs      = (int *)malloc(mpi_size * sizeof(int));
 
+    /* MPI_Allgatherv metadata for row-block data.  user_mean gathers one float
+     * per local user; sim_matrix gathers N_USERS floats per local user row. */
     for (int r = 0; r < mpi_size; r++) {
         int s, e;
         get_range(r, mpi_size, &s, &e);
@@ -402,7 +510,8 @@ int main(int argc, char *argv[])
     if (mpi_rank == 0)
         printf("[Timing] Data generation    : %.4f s\n", t1 - t0);
 
-    /* ── Phase 2: pthread workers, then main-thread MPI_Allgatherv. ── */
+    /* Phase 2: pthread workers compute local user means, then MPI gathers the
+     * complete user_mean array onto every rank for Pearson similarity. */
     MPI_Barrier(MPI_COMM_WORLD);
     t0 = now_sec();
     run_parallel(thread_user_means, threads, args, start_u, end_u);
@@ -416,7 +525,8 @@ int main(int argc, char *argv[])
         printf("[Timing] User mean compute  : %.4f s"
                "  [MPI %d × PT %d]\n", t1 - t0, mpi_size, N_THREADS);
 
-    /* ── Phase 3: pthread workers, then main-thread MPI_Allgatherv. ── */
+    /* Phase 3: pthread workers compute this rank's similarity rows, then MPI
+     * gathers all rows so every rank can make predictions independently. */
     MPI_Barrier(MPI_COMM_WORLD);
     t0 = now_sec();
     run_parallel(thread_similarities, threads, args, start_u, end_u);
@@ -433,7 +543,8 @@ int main(int argc, char *argv[])
         printf("[Check]  Sim-matrix checksum: %.6f\n", similarity_checksum());
     }
 
-    /* ── Phase 4: each rank holds full SIM matrix; no MPI call needed. ── */
+    /* Phase 4: each rank now has the full SIM matrix; it predicts only its own
+     * user rows, so no communication is needed during prediction. */
     MPI_Barrier(MPI_COMM_WORLD);
     t0 = now_sec();
     run_parallel(thread_predictions, threads, args, start_u, end_u);
@@ -442,6 +553,8 @@ int main(int argc, char *argv[])
     if (mpi_rank == 0)
         printf("[Timing] Prediction phase   : %.4f s"
                "  [MPI %d × PT %d]\n", t_pred, mpi_size, N_THREADS);
+
+    dump_test_predictions_json_mpi(start_u, end_u);
 
     float mae  = evaluate_mae(start_u, end_u);
     float rmse = evaluate_rmse(start_u, end_u);
