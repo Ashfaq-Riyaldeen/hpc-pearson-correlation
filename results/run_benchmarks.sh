@@ -51,8 +51,9 @@ echo "=== Compiling all versions ==="
 gcc  -O2 -Wall           -o "$ROOT/serial_rec"   "$ROOT/serial/serial_recommender.c"              -lm
 gcc  -O2 -Wall -fopenmp  -o "$ROOT/openmp_rec"   "$ROOT/openmp/openmp_recommender.c"              -lm
 gcc  -O2 -Wall           -o "$ROOT/pthreads_rec" "$ROOT/pthreads/pthreads_recommender.c" -lpthread -lm
-mpicc -O2 -Wall          -o "$ROOT/mpi_rec"      "$ROOT/mpi/mpi_recommender.c"                    -lm
-mpicc -O2 -Wall -fopenmp -o "$ROOT/hybrid_rec"   "$ROOT/hybrid/hybrid_recommender.c"              -lm
+mpicc -O2 -Wall          -o "$ROOT/mpi_rec"          "$ROOT/mpi/mpi_recommender.c"                                  -lm
+mpicc -O2 -Wall -fopenmp -o "$ROOT/hybrid_omp_rec"   "$ROOT/hybrid/mpi_openmp/hybrid_recommender.c"                 -lm
+mpicc -O2 -Wall          -o "$ROOT/hybrid_pt_rec"    "$ROOT/hybrid/mpi_pthreads/hybrid_pthreads_recommender.c" -lpthread -lm
 
 # CUDA is optional: only build it when the toolkit (nvcc) is present, so this
 # script still runs end-to-end on a CPU-only machine.
@@ -181,16 +182,27 @@ else
     echo ""
 fi
 
-# ── 6. Hybrid ─────────────────────────────────────────────────────────────
+# ── 6. Hybrid MPI+OpenMP ──────────────────────────────────────────────────
 for CONFIG in "2 4" "4 2" "8 1" "1 8"; do
     P=$(echo $CONFIG | awk '{print $1}')
     T=$(echo $CONFIG | awk '{print $2}')
     WORKERS=$((P * T))
     run_and_record "Hybrid_${P}x${T}" "$WORKERS" \
-        "mpirun -np $P env OMP_NUM_THREADS=$T \"$ROOT/hybrid_rec\" $SIZE"
+        "mpirun -np $P env OMP_NUM_THREADS=$T \"$ROOT/hybrid_omp_rec\" $SIZE"
 done
 
-# ── 7. Scalability sweep across problem sizes (Analysis Report §4.7) ───────
+# ── 7. Hybrid MPI+Pthreads ────────────────────────────────────────────────
+# Same four P×T layouts as the OpenMP hybrid so the two can be compared
+# head-to-head at identical total worker counts.
+for CONFIG in "2 4" "4 2" "8 1" "1 8"; do
+    P=$(echo $CONFIG | awk '{print $1}')
+    T=$(echo $CONFIG | awk '{print $2}')
+    WORKERS=$((P * T))
+    run_and_record "HybridPT_${P}x${T}" "$WORKERS" \
+        "mpirun -np $P \"$ROOT/hybrid_pt_rec\" $SIZE $T"
+done
+
+# ── 8. Scalability sweep across problem sizes (Analysis Report §4.7) ───────
 # Strong-scaling above varied the worker count at a fixed 1000x1000 problem.
 # Here we vary the PROBLEM SIZE at fixed best configs (Serial, OpenMP 8T,
 # MPI 8P, CUDA) to show how each model sustains its speedup as N grows.

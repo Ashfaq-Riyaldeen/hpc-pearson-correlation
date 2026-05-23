@@ -3,13 +3,13 @@
 **EC7207 / EE7218 — High Performance Computing · Group 11**
 
 A user-based collaborative-filtering recommender (Pearson-correlation user
-similarity + top-K weighted prediction) implemented **six ways** so their
-performance and accuracy can be compared: a **serial** baseline plus five
-parallel versions — **OpenMP**, **POSIX Threads**, **MPI**, **CUDA**, and a
-**Hybrid MPI+OpenMP**. Every version runs the *same* algorithm on the *same*
-data (`SEED=42`), so only the runtime differs — and all of them produce an
-identical MAE, RMSE, and similarity-matrix checksum, which is how correctness
-is verified.
+similarity + top-K weighted prediction) implemented **seven ways** so their
+performance and accuracy can be compared: a **serial** baseline plus six
+parallel versions — **OpenMP**, **POSIX Threads**, **MPI**, **CUDA**, a
+**Hybrid MPI+OpenMP**, and a **Hybrid MPI+Pthreads**. Every version runs the
+*same* algorithm on the *same* data (`SEED=42`), so only the runtime differs —
+and all of them produce an identical MAE, RMSE, and similarity-matrix
+checksum, which is how correctness is verified.
 
 - Group: EG/2021/4417 (Ashfaq M.R.M.) · EG/2021/4419 (Athanayaka K.A.L.G.) · EG/2021/4424 (Balasooriya J.M.)
 - Reference platform: Linux (Pop!_OS 24.04), Intel Core i7-11800H (8 physical / 16 logical), NVIDIA GeForce RTX 3050 Laptop GPU (compute capability **8.6**).
@@ -19,7 +19,10 @@ is verified.
 ## Repository structure
 
 ```
-serial/    openmp/    pthreads/    mpi/    cuda/    hybrid/   # one *_recommender.{c,cu} per version
+serial/    openmp/    pthreads/    mpi/    cuda/        # one *_recommender.{c,cu} per single-technology version
+hybrid/                                                 # two hybrid variants in their own subfolders:
+    mpi_openmp/   hybrid_recommender.c                  #   MPI + OpenMP   (inner OpenMP thread team)
+    mpi_pthreads/ hybrid_pthreads_recommender.c         #   MPI + Pthreads (inner pthread fan-out/join)
 results/             # run_benchmarks.sh (canonical runner) + benchmark data (CSV / txt)
 analysis_report/     # ANALYSIS_REPORT.md  +  analysis_report.tex / .pdf  (the report)
 analysis_diagrams/   # drawio/ concept diagrams (+ png/), charts/, generate_charts.py
@@ -35,7 +38,8 @@ README.md   CLAUDE.md
 | Tool | Needed for | Notes |
 |------|------------|-------|
 | GCC (with `-fopenmp`) | Serial, OpenMP, Pthreads | `build-essential` on Debian/Ubuntu |
-| An MPI implementation | MPI, Hybrid | Open MPI (`mpicc`/`mpirun`) on Linux, or MS-MPI (`mpiexec`) on Windows |
+| An MPI implementation | MPI, both Hybrids | Open MPI (`mpicc`/`mpirun`) on Linux, or MS-MPI (`mpiexec`) on Windows |
+| POSIX threads (`-lpthread`) | Pthreads, Hybrid MPI+Pthreads | Ships with glibc on Linux |
 | NVIDIA CUDA Toolkit (`nvcc`) + NVIDIA GPU | CUDA only | Match `-arch` to your GPU (see §4). The other five versions need **no** GPU |
 | `bc`, `awk`, `grep`, `bash` | `results/run_benchmarks.sh` | Standard on Linux |
 | Python 3 + `matplotlib`, `numpy` | Regenerating charts | `analysis_diagrams/generate_charts.py` |
@@ -182,16 +186,16 @@ over that rank's rows in shared memory. With **P** ranks × **T** threads you ge
 **P × T** workers while sending only **P** messages per collective.
 
 ```bash
-mpicc -O2 -Wall -fopenmp -o hybrid_rec hybrid/hybrid_recommender.c -lm
+mpicc -O2 -Wall -fopenmp -o hybrid_omp_rec hybrid/mpi_openmp/hybrid_recommender.c -lm
 ```
 
 Set MPI processes with `-np` and OpenMP threads with `OMP_NUM_THREADS`:
 
 ```bash
-mpirun -np 2 env OMP_NUM_THREADS=4 ./hybrid_rec     # 2 × 4 = 8 workers
-mpirun -np 4 env OMP_NUM_THREADS=2 ./hybrid_rec     # 4 × 2 = 8 workers
-mpirun -np 1 env OMP_NUM_THREADS=8 ./hybrid_rec     # pure-OpenMP-like
-mpirun -np 2 env OMP_NUM_THREADS=4 ./hybrid_rec 2000 1500
+mpirun -np 2 env OMP_NUM_THREADS=4 ./hybrid_omp_rec     # 2 × 4 = 8 workers
+mpirun -np 4 env OMP_NUM_THREADS=2 ./hybrid_omp_rec     # 4 × 2 = 8 workers
+mpirun -np 1 env OMP_NUM_THREADS=8 ./hybrid_omp_rec     # pure-OpenMP-like
+mpirun -np 2 env OMP_NUM_THREADS=4 ./hybrid_omp_rec 2000 1500
 ```
 
 > On some systems use `-x OMP_NUM_THREADS=4` (Open MPI) or
@@ -206,66 +210,83 @@ mpirun -np 2 env OMP_NUM_THREADS=4 ./hybrid_rec 2000 1500
 | Predictions | each rank predicts its users | `parallel` + private buffer |
 | MAE / RMSE | `MPI_Reduce` | `reduction(+:...)` |
 
----
+### 7. Hybrid MPI + Pthreads
 
----
-
-## 3. MPI Distributed Memory Version
-
-### Compile (run once from the folder)
-
-```bash
-mpicc -O2 -Wall -o mpi_rec mpi/mpi_recommender.c -lm
-```
-
-### Run – process count via `mpirun -np`
+Same outer structure as version 6, but the inner shared-memory layer uses raw
+POSIX threads instead of an OpenMP team. **MPI** still divides users across
+processes (same `MPI_Allgatherv` / `MPI_Reduce` / `MPI_THREAD_FUNNELED`
+contract); inside each rank, `pthread_create` / `pthread_join` is run once per
+parallel phase (no persistent thread pool). With **P** ranks × **T** pthreads
+you again get **P × T** workers; thread count is the **third CLI argument**, not
+an environment variable — matching the pure-pthreads convention.
 
 ```bash
-# Default sizes (1000 users, 1000 items) – vary process count only
-mpirun -np 2 ./mpi_rec
-mpirun -np 4 ./mpi_rec
-mpirun -np 8 ./mpi_rec
-
-# Custom sizes: mpirun -np <num_procs> ./mpi_rec [num_users] [num_items]
-mpirun -np 4 ./mpi_rec 500 300
-mpirun -np 2 ./mpi_rec 2000 1500
-mpirun -np 4 ./mpi_rec 2000 1500
+mpicc -O2 -Wall -o hybrid_pt_rec hybrid/mpi_pthreads/hybrid_pthreads_recommender.c -lpthread -lm
 ```
 
-### Key Features
-- **Distributed similarity computation**: Each process computes its assigned block of user similarity matrix rows
-- **Data broadcasting**: Rating matrix distributed from rank 0 to all processes
-- **Allgatherv**: Efficient gathering of similarity rows and predictions across all processes
-- **Scalability**: Linear scaling with number of MPI processes (up to the number of users)
+```bash
+mpirun -np 2 ./hybrid_pt_rec 1000 1000 4     # 2 × 4 = 8 workers
+mpirun -np 4 ./hybrid_pt_rec 1000 1000 2     # 4 × 2 = 8 workers
+mpirun -np 8 ./hybrid_pt_rec 1000 1000 1     # pure-MPI-like
+mpirun -np 1 ./hybrid_pt_rec 1000 1000 8     # pure-pthreads-like
+mpirun -np 2 ./hybrid_pt_rec 2000 1500 4
+```
+
+| Phase | MPI (between processes) | Pthreads (within a process) |
+|-------|-------------------------|------------------------------|
+| Data generation | each rank runs the same RNG | serial (data is identical) |
+| User means | each rank computes its rows | `pthread_create` × T, static `work_range` |
+| Similarity | each rank computes its rows | `pthread_create` × T, static `work_range` |
+| Gather | `MPI_Allgatherv` (main thread, post-join) | — |
+| Predictions | each rank predicts its users | `pthread_create` × T, private `nbrs[]` per thread |
+| MAE / RMSE | `MPI_Reduce` (main thread) | sequential per rank (small test set) |
+
+> The two hybrids are head-to-head comparable at the same `P × T`: only the
+> intra-node threading model differs. See the report's §2.7 and §5.7 for the
+> direct comparison.
 
 ---
 
-## 4. Speedup Benchmark (for the report)
+## Reproducing the speedup table by hand
+
+`results/run_benchmarks.sh` does this automatically; the manual equivalent is:
 
 ```bash
-# Compile all three versions
-gcc -O2 -Wall -o serial_rec serial/serial_recommender.c -lm
-gcc -O2 -Wall -fopenmp -o openmp_rec openmp/openmp_recommender.c -lm
-mpicc -O2 -Wall -o mpi_rec mpi/mpi_recommender.c -lm
+# Compile all versions
+gcc   -O2 -Wall            -o serial_rec      serial/serial_recommender.c                                  -lm
+gcc   -O2 -Wall -fopenmp   -o openmp_rec      openmp/openmp_recommender.c                                  -lm
+gcc   -O2 -Wall            -o pthreads_rec    pthreads/pthreads_recommender.c                     -lpthread -lm
+mpicc -O2 -Wall            -o mpi_rec         mpi/mpi_recommender.c                                        -lm
+mpicc -O2 -Wall -fopenmp   -o hybrid_omp_rec  hybrid/mpi_openmp/hybrid_recommender.c                       -lm
+mpicc -O2 -Wall            -o hybrid_pt_rec   hybrid/mpi_pthreads/hybrid_pthreads_recommender.c   -lpthread -lm
+nvcc  -O2 -arch=sm_86      -o cuda_rec        cuda/cuda_recommender.cu                                     -lm
 
-# Serial baseline
-./serial_rec
-
-# OpenMP scaling (1 thread = baseline)
-OMP_NUM_THREADS=1  ./openmp_rec
-OMP_NUM_THREADS=2  ./openmp_rec
-OMP_NUM_THREADS=4  ./openmp_rec
-OMP_NUM_THREADS=8  ./openmp_rec
-
-mpirun -np 1 ./mpi_rec
-mpirun -np 2 ./mpi_rec
-mpirun -np 4 ./mpi_rec
-mpirun -np 8 ./mpi_rec
+# Baseline + worker sweeps
+./serial_rec 1000 1000
+for T in 1 2 4 8; do OMP_NUM_THREADS=$T ./openmp_rec 1000 1000; done
+for T in 1 2 4 8; do ./pthreads_rec 1000 1000 $T; done
+for P in 1 2 4 8; do mpirun -np $P ./mpi_rec 1000 1000; done
+./cuda_rec 1000 1000
+for C in "2 4" "4 2" "8 1" "1 8"; do set -- $C; mpirun -np $1 env OMP_NUM_THREADS=$2 ./hybrid_omp_rec 1000 1000; done
+for C in "2 4" "4 2" "8 1" "1 8"; do set -- $C; mpirun -np $1 ./hybrid_pt_rec 1000 1000 $2; done
 ```
 
-### Performance Analysis
-- Compare **execution times** across serial, OpenMP, and MPI versions
-- Calculate **speedup** = Serial_Time / Parallel_Time
-- Analyze **efficiency** = Speedup / Number_of_Processors
-- Observe **strong scaling** (fixed problem size, increase processors)
-- Observe **weak scaling** (increase both problem size and processors proportionally)
+Read the `[Timing] Total (sim+pred)` line from each run.
+**Speedup = Serial_total / Parallel_total.**
+
+---
+
+## Results, report & diagrams
+
+- **Report:** `analysis_report/analysis_report.pdf` (built from `analysis_report.tex`); a Markdown twin is at `analysis_report/ANALYSIS_REPORT.md`.
+- **Concept diagrams:** `analysis_diagrams/drawio/` (editable `.drawio` + exported `png/`).
+- **Performance charts:** `analysis_diagrams/charts/` (generated from `results/` by `generate_charts.py`).
+- **Raw data:** `results/timing_raw.txt`, `speedup_table.csv`, `mae_comparison.txt`.
+
+## Correctness
+
+Every version (CPU and GPU) produces an identical **MAE = 1.2574**,
+**RMSE = 1.4579**, and **similarity-matrix checksum = 942.387323** for the
+default 1000×1000 / `SEED=42` input. Matching results across all versions is
+the project's correctness check — any deviation would indicate a race condition
+or a partitioning bug.
